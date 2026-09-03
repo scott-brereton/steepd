@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.localdata/
+*.sqlite3
+.wrangler/
+.playwright-mcp/
+.superpowers/
+# Operator notes, kept locally only.
+docs/BEFORE-LAUNCH.md
+
+# Local data, databases, and secrets.
+/data/
+*.sqlite3-wal
+*.sqlite3-shm
+.env
+.env.*
+.claude/settings.local.json

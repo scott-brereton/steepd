@@ -1,0 +1,17 @@
+name = "steepd-uptime"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[[kv_namespaces]]
+binding = "STATE"
+id = "26bc4092d861470dbb9f45a092aff990"
+
+# ALERT_TO (the operator's mailbox) is deliberately not in this file: the repo is
+# public and a plain-text address here would be harvestable. It is a Worker secret,
+# set with `wrangler secret put ALERT_TO`, which survives deploys.
+[vars]
+HEALTH_URL = "https://steepd.app/healthz"
+ALERT_FROM = "Steepd uptime <hello@steepd.app>"

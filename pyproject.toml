@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "steepd"
+version = "0.1.0"
+description = "A hosted reader service: email newsletters and books to your e-reader"
+requires-python = ">=3.13,<3.14"
+license = "AGPL-3.0-or-later"
+dependencies = [
+  "beautifulsoup4==4.15.0",
+  "defusedxml==0.7.1",
+  "ebooklib==0.20",
+  "fastapi==0.141.1",
+  "httpx==0.28.1",
+  "svix==2.0.0",
+  "uvicorn==0.52.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==9.1.1", "ruff==0.16.4"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/steepd"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "UP"]
