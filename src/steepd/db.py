@@ -112,6 +112,17 @@ CREATE TABLE IF NOT EXISTS sessions (
     expires_at TEXT NOT NULL
 );
 
+-- A tenant can deliberately relay one inbound message to their registered account
+-- address, for services such as Gmail that prove a forwarding destination by email.
+-- claimed_event_id is an atomic lease: concurrent webhook deliveries cannot both spend
+-- the same five-minute window. At most one row exists per tenant, so expired rows are
+-- bounded by the account count and are replaced the next time the checkbox is enabled.
+CREATE TABLE IF NOT EXISTS email_verification_relays (
+    tenant_id TEXT PRIMARY KEY REFERENCES tenants(id) ON DELETE CASCADE,
+    expires_at TEXT NOT NULL,
+    claimed_event_id TEXT
+);
+
 -- Who a tenant on the 'listed' policy accepts mail from, on top of their own account
 -- email, which is always accepted and never stored here.
 CREATE TABLE IF NOT EXISTS allowed_senders (
@@ -141,10 +152,10 @@ CREATE TABLE IF NOT EXISTS retired_inbox_locals (
     retired_at  TEXT NOT NULL
 );
 
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
 """
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Columns cannot be added by CREATE TABLE IF NOT EXISTS, so a database already carrying
 # tenants gets them by hand. Every existing account keeps its name and counts as
@@ -184,8 +195,8 @@ class Database:
 
     def initialize(self) -> None:
         """Create or upgrade the schema. A fresh database reads version 0, skips the
-        migration and gets the v5 CREATEs; a v5 database re-runs SCHEMA, which is all
-        IF NOT EXISTS."""
+        migration and gets the current CREATEs; a v5 database gains the relay table
+        through CREATE TABLE IF NOT EXISTS, without rewriting the tenants table."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._write_lock, self._session() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -416,8 +427,8 @@ class Database:
         return device_password
 
     def delete_tenant(self, tenant_id: str) -> bool:
-        """Delete the tenant row; items, magic_tokens, sessions and newsletter_deliveries go
-        with it through ON DELETE CASCADE (foreign_keys is ON for every connection).
+        """Delete the tenant row; items, auth rows, verification relays and newsletter
+        deliveries go with it through ON DELETE CASCADE (foreign_keys is ON for every connection).
 
         Files on disk are not this method's concern and are not reachable once the rows are
         gone, so callers delete them first through ItemStorage.delete_all_for_tenant. Doing
@@ -436,6 +447,91 @@ class Database:
                     (row["inbox_local"], datetime.now(UTC).isoformat()),
                 )
             cursor = connection.execute("DELETE FROM tenants WHERE id = ?", (tenant_id,))
+        return cursor.rowcount == 1
+
+    # -- temporary email-verification relay -------------------------------
+
+    def enable_email_verification_relay(self, tenant_id: str, *, expires_at: str) -> bool:
+        """Arm or renew one tenant's one-shot relay, returning False for an unknown tenant.
+
+        Re-enabling also clears an in-flight claim. That is deliberate: the owner just
+        asked for a fresh five-minute window, and completion of the older webhook is
+        scoped to its event id so it cannot delete the replacement.
+        """
+        with self._write_lock, self._session() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO email_verification_relays (tenant_id, expires_at, claimed_event_id)
+                SELECT id, ?, NULL FROM tenants WHERE id = ?
+                ON CONFLICT(tenant_id) DO UPDATE SET
+                    expires_at = excluded.expires_at,
+                    claimed_event_id = NULL
+                """,
+                (expires_at, tenant_id),
+            )
+        return cursor.rowcount == 1
+
+    def disable_email_verification_relay(self, tenant_id: str) -> bool:
+        with self._write_lock, self._session() as connection:
+            cursor = connection.execute(
+                "DELETE FROM email_verification_relays WHERE tenant_id = ?", (tenant_id,)
+            )
+        return cursor.rowcount == 1
+
+    def email_verification_relay_expires_at(self, tenant_id: str, *, now: str) -> str | None:
+        """Return the deadline only while the window can still be used.
+
+        A claimed row remains visible as on for the brief time its email is being relayed;
+        it disappears after the send succeeds. An expired row reads as off without needing
+        a write on every account-page request.
+        """
+        with self._session() as connection:
+            row = connection.execute(
+                """
+                SELECT expires_at FROM email_verification_relays
+                 WHERE tenant_id = ? AND expires_at > ?
+                """,
+                (tenant_id, now),
+            ).fetchone()
+        return str(row["expires_at"]) if row is not None else None
+
+    def claim_email_verification_relay(self, tenant_id: str, *, event_id: str, now: str) -> bool:
+        """Atomically reserve an active window for one webhook delivery."""
+        with self._write_lock, self._session() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE email_verification_relays
+                   SET claimed_event_id = ?
+                 WHERE tenant_id = ?
+                   AND expires_at > ?
+                   AND claimed_event_id IS NULL
+                """,
+                (event_id, tenant_id, now),
+            )
+        return cursor.rowcount == 1
+
+    def release_email_verification_relay(self, tenant_id: str, *, event_id: str) -> bool:
+        """Hand a failed relay back so a webhook retry can make the same attempt."""
+        with self._write_lock, self._session() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE email_verification_relays SET claimed_event_id = NULL
+                 WHERE tenant_id = ? AND claimed_event_id = ?
+                """,
+                (tenant_id, event_id),
+            )
+        return cursor.rowcount == 1
+
+    def complete_email_verification_relay(self, tenant_id: str, *, event_id: str) -> bool:
+        """Spend the window after its claimed message was successfully relayed."""
+        with self._write_lock, self._session() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM email_verification_relays
+                 WHERE tenant_id = ? AND claimed_event_id = ?
+                """,
+                (tenant_id, event_id),
+            )
         return cursor.rowcount == 1
 
     # -- sender policy ----------------------------------------------------

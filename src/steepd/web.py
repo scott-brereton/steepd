@@ -80,6 +80,7 @@ ACCOUNT_SORT_LABELS = {"newest": "Newest", "oldest": "Oldest", "title": "Title"}
 ACCOUNT_QUERY_MAX_LENGTH = 160
 USAGE_WARNING_PERCENT = 85
 DELETE_CONFIRMATION_FIELD = "confirm"
+EMAIL_VERIFICATION_RELAY_DURATION = timedelta(minutes=5)
 
 # Every form on these pages is one short field. Registered with the body-size middleware
 # in app.py so an unauthenticated POST cannot make the server buffer an arbitrary body;
@@ -95,6 +96,7 @@ FORM_ROUTE_LIMITS = {
         "/account/address",
         "/account/rotate",
         "/account/delete",
+        "/account/email-verification",
         "/account/senders/policy",
         "/account/senders/add",
         "/account/senders/remove",
@@ -744,6 +746,41 @@ def _senders_section(tenant: Tenant, senders: list[str], refused: list[RefusedSe
     )
 
 
+def _email_verification_section(
+    tenant: Tenant,
+    *,
+    relay_until: str | None,
+    available: bool,
+) -> str:
+    """The deliberately narrow escape hatch for forwarding-service verification.
+
+    There is no destination field: the account address is the only possible recipient.
+    The checkbox describes the two other limits that matter -- one message and five
+    minutes -- so turning it on cannot look like a general forwarding rule.
+    """
+    checked = " checked" if relay_until is not None else ""
+    disabled = " disabled" if not available else ""
+    availability = (
+        ""
+        if available
+        else '<p class="fineprint">Email verification forwarding is not available on this deployment.</p>'
+    )
+    return (
+        "<section><h2>Email Verification</h2>"
+        "<p>Gmail and some other services send a message to your Steepd address before "
+        "they will automatically forward mail. Turn this on immediately before requesting "
+        "that message.</p>"
+        '<form method="post" action="/account/email-verification">'
+        f'<label class="confirm"><input type="checkbox" name="enabled" value="yes"{checked}{disabled}> '
+        "Forward my next email for five minutes</label>"
+        f'<button class="quiet" type="submit"{disabled}>Save</button></form>'
+        "<p class=\"fineprint\">The first email sent to your Steepd address will be forwarded "
+        f"to <code>{html.escape(tenant.email)}</code> instead of added to your library. "
+        "This switches off after that first email or five minutes.</p>"
+        f"{availability}</section>"
+    )
+
+
 def _account_page(
     tenant: Tenant,
     view: LibraryView,
@@ -753,11 +790,18 @@ def _account_page(
     storage_bytes: int,
     inbox_address: str,
     catalogue_url: str,
+    email_verification_until: str | None,
+    email_verification_available: bool,
     error: str = "",
     status_code: int = status.HTTP_200_OK,
 ) -> HTMLResponse:
     retention = retention_for(tenant.plan)
     listing = _library_section(view, retention=retention, now=datetime.now(UTC))
+    verification = _email_verification_section(
+        tenant,
+        relay_until=email_verification_until,
+        available=email_verification_available,
+    )
     return _page(
         "Steepd — your account",
         f"{_notice(error)}"
@@ -772,6 +816,7 @@ def _account_page(
         '<p class="fineprint"><a href="/devices">How to set this up on your reader</a></p>'
         f"<section><h2>Your library</h2>{listing}</section>"
         f"{_senders_section(tenant, senders, refused)}"
+        f"{verification}"
         "<section><h2>Device password</h2>"
         "<p>Your reader signs in with the username above and a device password. Generate one here "
         "whether it is your first or a replacement — it is shown once and never stored.</p>"
@@ -1120,8 +1165,9 @@ def _privacy_page(*, contact: str = "", source_url: str = "") -> HTMLResponse:
         '<p class="lede">Steepd holds your reading, so it holds as little else as it can and shows '
         "none of it to anyone.</p>"
         "<section><h2>What we hold</h2>"
-        "<p>You sign up with an email address. It is used to send you sign-in links and for nothing "
-        "else: no newsletter, no product mail, and it is not passed on.</p>"
+        "<p>You sign up with an email address. It is used to send you sign-in links and, when you "
+        "ask for it, to relay one temporary forwarding-verification email. It is not used for a "
+        "newsletter or product mail, and it is not passed on.</p>"
         "<p>When you forward an email or send a public webpage URL to your Steepd address, we convert "
         "it and store the result as an EPUB in your library. That file belongs to your account and is "
         "reachable only with your "
@@ -1707,6 +1753,12 @@ def build_web_router(settings: Settings, database: Database, storage: ItemStorag
         status_code: int = status.HTTP_200_OK,
     ) -> HTMLResponse:
         scope = TenantScope(tenant.id)
+        verification_available = bool(
+            settings.inbox_domain
+            and settings.resend_api_key
+            and settings.resend_webhook_secret
+            and settings.mail_from_address
+        )
         return _account_page(
             tenant,
             _library_view(scope, query=query, sort=sort, page=page),
@@ -1715,6 +1767,10 @@ def build_web_router(settings: Settings, database: Database, storage: ItemStorag
             storage_bytes=database.tenant_storage_bytes(scope),
             inbox_address=_inbox_address(tenant),
             catalogue_url=catalogue_url,
+            email_verification_until=database.email_verification_relay_expires_at(
+                tenant.id, now=datetime.now(UTC).isoformat()
+            ),
+            email_verification_available=verification_available,
             error=error,
             status_code=status_code,
         )
@@ -1948,6 +2004,35 @@ def build_web_router(settings: Settings, database: Database, storage: ItemStorag
             # The tenant went away between resolving the session and the update.
             return _redirect("/signin")
         return _password_page(password)
+
+    @router.post("/account/email-verification", dependencies=[SameOrigin])
+    async def set_email_verification(request: Request, session: SignedIn) -> Response:
+        enabled = (await _form_fields(request)).get("enabled") == "yes"
+        if not enabled:
+            await run_in_threadpool(database.disable_email_verification_relay, session.tenant.id)
+            return _redirect("/account")
+
+        verification_available = bool(
+            settings.inbox_domain
+            and settings.resend_api_key
+            and settings.resend_webhook_secret
+            and settings.mail_from_address
+        )
+        if not verification_available:
+            return await run_in_threadpool(
+                _render_account,
+                session.tenant,
+                error="Email verification forwarding is not available on this deployment.",
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        expires_at = (datetime.now(UTC) + EMAIL_VERIFICATION_RELAY_DURATION).isoformat()
+        armed = await run_in_threadpool(
+            database.enable_email_verification_relay,
+            session.tenant.id,
+            expires_at=expires_at,
+        )
+        return _redirect("/account" if armed else "/signin")
 
     @router.post("/account/senders/policy", dependencies=[SameOrigin])
     async def set_policy(request: Request, session: SignedIn) -> Response:

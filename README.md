@@ -26,6 +26,10 @@ source for it, under the AGPL, so you can also run your own.
   username and a device passphrase generated from the account page.
 - Anyone who has your address can send to it by default. The account page can restrict
   that to listed senders.
+- The account page's **Email Verification** checkbox can relay exactly the next inbound
+  message to the account email, for services such as Gmail that verify an auto-forwarding
+  address. That message bypasses the sender list, is not filed, and the relay switches off
+  after the message or five minutes. It cannot forward anywhere else.
 - If something you sent could not be filed, you get one email saying why and up to three
   practical things to try.
 
@@ -48,7 +52,8 @@ What you need:
   pointed at [Resend](https://resend.com), which is the only mail provider the code
   speaks. Resend receives the mail and calls the webhook; Steepd fetches the message and
   attachments through Resend's API.
-- **A verified sending address** on Resend, for sign-in links and rejection replies.
+- **A verified sending address** on Resend, for sign-in links, rejection replies and
+  temporary email-verification relays.
 - **A public HTTPS address** for the service, since e-readers fetch the catalogue from it
   and Resend posts webhooks to it.
 
@@ -104,7 +109,7 @@ Optional, each feature off until set:
 
 | Variable | Meaning |
 |---|---|
-| `MAIL_FROM_ADDRESS` | The From for all outbound mail, e.g. `Steepd <hello@example.com>`. Without it there is no sign-in by email and no rejection replies. |
+| `MAIL_FROM_ADDRESS` | The From for all outbound mail, e.g. `Steepd <hello@example.com>`. Without it there is no sign-in by email, rejection replies or temporary email-verification relay. |
 | `APP_ENVIRONMENT` | `production` turns on the hourly retention sweep and requires HTTPS. Anything else is development. |
 | `PORT` | Listening port. Defaults to 8000. |
 | `STATS_TOKEN` | Bearer token for `GET /admin/stats`, which prints accounts, items, thirty days of inbound results and disk usage. Unset, the route answers 404 to everyone. `ops/stats.sh` wraps the request. |

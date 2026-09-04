@@ -49,13 +49,13 @@ def _build_version_4_database(path):
     return Database(path)
 
 
-def test_fresh_database_is_version_5_with_the_new_columns(database):
-    assert _version(database) == SCHEMA_VERSION == 5
+def test_fresh_database_is_version_6_with_email_verification_relays(database):
+    assert _version(database) == SCHEMA_VERSION == 6
     with database._connect() as connection:
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(tenants)")}
         tables = {row["name"] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"inbox_confirmed_at", "sender_policy"} <= columns
-    assert {"allowed_senders", "refused_senders", "retired_inbox_locals"} <= tables
+    assert {"allowed_senders", "refused_senders", "retired_inbox_locals", "email_verification_relays"} <= tables
 
 
 def test_a_version_4_database_upgrades_in_place_and_existing_tenants_are_confirmed(tmp_path):
@@ -63,12 +63,29 @@ def test_a_version_4_database_upgrades_in_place_and_existing_tenants_are_confirm
     database.initialize()
     database.initialize()  # idempotent
 
-    assert _version(database) == 5
+    assert _version(database) == 6
     tenant = database.tenant_by_email("ada@example.com")
     assert tenant is not None
     assert tenant.inbox_confirmed_at == "2026-08-01T00:00:00+00:00"
     assert tenant.sender_policy == "anyone"
     assert database.tenant_by_inbox_local("ada.1") is not None
+
+
+def test_a_version_5_database_gains_the_relay_table_without_losing_accounts(tmp_path):
+    database = Database(tmp_path / "version-5.sqlite3")
+    database.initialize()
+    tenant = database.create_tenant(email="ada@example.com", inbox_local="ada")
+    with database._connect() as connection:
+        connection.execute("DROP TABLE email_verification_relays")
+        connection.execute("PRAGMA user_version = 5")
+
+    database.initialize()
+
+    assert _version(database) == 6
+    assert database.tenant_by_id(tenant.id) == tenant
+    with database._connect() as connection:
+        tables = {row["name"] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "email_verification_relays" in tables
 
 
 def test_a_half_finished_migration_leaves_the_database_untouched_and_still_upgradable(tmp_path, monkeypatch):
@@ -93,8 +110,56 @@ def test_a_half_finished_migration_leaves_the_database_untouched_and_still_upgra
 
     monkeypatch.undo()
     database.initialize()
-    assert _version(database) == 5
+    assert _version(database) == 6
     assert database.tenant_by_email("ada@example.com").inbox_confirmed_at == "2026-08-01T00:00:00+00:00"
+
+
+def test_email_verification_relay_is_expiring_one_shot_and_claimed_atomically(database):
+    tenant = database.create_tenant(email="ada@example.com", inbox_local="ada")
+    future = (NOW + timedelta(minutes=5)).isoformat()
+
+    assert database.enable_email_verification_relay(tenant.id, expires_at=future) is True
+    assert database.email_verification_relay_expires_at(tenant.id, now=NOW.isoformat()) == future
+
+    assert database.claim_email_verification_relay(tenant.id, event_id="evt-1", now=NOW.isoformat()) is True
+    assert database.claim_email_verification_relay(tenant.id, event_id="evt-2", now=NOW.isoformat()) is False
+
+    assert database.release_email_verification_relay(tenant.id, event_id="evt-wrong") is False
+    assert database.release_email_verification_relay(tenant.id, event_id="evt-1") is True
+    assert database.claim_email_verification_relay(tenant.id, event_id="evt-2", now=NOW.isoformat()) is True
+    assert database.complete_email_verification_relay(tenant.id, event_id="evt-2") is True
+    assert database.email_verification_relay_expires_at(tenant.id, now=NOW.isoformat()) is None
+
+
+def test_an_expired_or_disabled_email_verification_relay_cannot_be_claimed(database):
+    tenant = database.create_tenant(email="ada@example.com", inbox_local="ada")
+    past = (NOW - timedelta(seconds=1)).isoformat()
+
+    database.enable_email_verification_relay(tenant.id, expires_at=past)
+    assert database.email_verification_relay_expires_at(tenant.id, now=NOW.isoformat()) is None
+    assert database.claim_email_verification_relay(tenant.id, event_id="evt-old", now=NOW.isoformat()) is False
+
+    database.enable_email_verification_relay(tenant.id, expires_at=(NOW + timedelta(minutes=5)).isoformat())
+    assert database.disable_email_verification_relay(tenant.id) is True
+    assert database.disable_email_verification_relay(tenant.id) is False
+    assert database.claim_email_verification_relay(tenant.id, event_id="evt-off", now=NOW.isoformat()) is False
+
+
+def test_enabling_a_relay_for_an_unknown_tenant_does_not_create_an_orphan(database):
+    assert (
+        database.enable_email_verification_relay(
+            "missing", expires_at=(NOW + timedelta(minutes=5)).isoformat()
+        )
+        is False
+    )
+
+
+def test_deleting_a_tenant_cascades_its_email_verification_relay(database):
+    tenant = database.create_tenant(email="ada@example.com", inbox_local="ada")
+    database.enable_email_verification_relay(tenant.id, expires_at=(NOW + timedelta(minutes=5)).isoformat())
+
+    assert database.delete_tenant(tenant.id) is True
+    assert database.email_verification_relay_expires_at(tenant.id, now=NOW.isoformat()) is None
 
 
 def test_a_pending_tenant_holds_a_placeholder_and_is_invisible_to_inbox_routing(database):

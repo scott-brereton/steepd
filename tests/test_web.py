@@ -364,6 +364,7 @@ def test_a_cross_site_rotate_post_is_rejected(web):
         "/account/senders/policy",
         "/account/senders/add",
         "/account/senders/remove",
+        "/account/email-verification",
     ],
 )
 def test_every_post_route_rejects_a_cross_site_origin(web, path):
@@ -1118,6 +1119,7 @@ def test_the_privacy_page_states_what_the_service_actually_does(web):
 
     assert response.status_code == 200
     assert "sign-in links" in response.text
+    assert "verification email" in response.text
     assert "fetched once" in response.text
     assert "public webpage html" in response.text.lower()
     assert "webpage images" in response.text.lower()
@@ -1691,6 +1693,73 @@ def test_refused_senders_are_offered_with_an_allow_button(web):
     assert database.list_allowed_senders(tenant.id) == ["news@dispatch.example"]
     assert database.list_refused_senders(tenant.id) == []
     assert "was not accepted" not in client.get("/account").text
+
+
+# -- temporary email verification relay -------------------------------------
+
+
+def test_email_verification_section_arms_and_disarms_a_five_minute_relay(tmp_path, monkeypatch):
+    from steepd.web import EMAIL_VERIFICATION_RELAY_DURATION
+
+    client, sent = _build_client(
+        tmp_path,
+        monkeypatch,
+        resend_api_key="key",
+        resend_webhook_secret="secret",
+        mail_from_address="Steepd <noreply@example.test>",
+    )
+    _sign_up(client, sent)
+    database = client.app.state.database
+    tenant = database.tenant_by_email(EMAIL)
+
+    page = BeautifulSoup(client.get("/account").text, "html.parser")
+    heading = page.find("h2", string="Email Verification")
+    assert heading is not None
+    section = heading.find_parent("section")
+    checkbox = section.find("input", {"name": "enabled"})
+    assert checkbox is not None and not checkbox.has_attr("checked") and not checkbox.has_attr("disabled")
+    assert "Gmail" in section.get_text(" ")
+    assert EMAIL in section.get_text(" ")
+    assert "first email" in section.get_text(" ").lower()
+    assert "five minutes" in section.get_text(" ").lower()
+
+    before = datetime.now(UTC)
+    armed = client.post(
+        "/account/email-verification", data={"enabled": "yes"}, follow_redirects=False
+    )
+    after = datetime.now(UTC)
+
+    assert armed.status_code == 303 and armed.headers["location"] == "/account"
+    expires_at = database.email_verification_relay_expires_at(tenant.id, now=before.isoformat())
+    assert expires_at is not None
+    expiry = datetime.fromisoformat(expires_at)
+    assert before + EMAIL_VERIFICATION_RELAY_DURATION <= expiry <= after + EMAIL_VERIFICATION_RELAY_DURATION
+    checkbox = BeautifulSoup(client.get("/account").text, "html.parser").find(
+        "input", {"name": "enabled"}
+    )
+    assert checkbox is not None and checkbox.has_attr("checked")
+
+    disarmed = client.post("/account/email-verification", data={}, follow_redirects=False)
+    assert disarmed.status_code == 303
+    assert database.email_verification_relay_expires_at(tenant.id, now=datetime.now(UTC).isoformat()) is None
+
+
+def test_email_verification_checkbox_is_disabled_when_outbound_mail_is_unavailable(web):
+    client, sent = web
+    _sign_up(client, sent)
+    database = client.app.state.database
+    tenant = database.tenant_by_email(EMAIL)
+
+    page = BeautifulSoup(client.get("/account").text, "html.parser")
+    heading = page.find("h2", string="Email Verification")
+    assert heading is not None
+    checkbox = heading.find_parent("section").find("input", {"name": "enabled"})
+    assert checkbox is not None and checkbox.has_attr("disabled")
+
+    response = client.post("/account/email-verification", data={"enabled": "yes"})
+    assert response.status_code == 503
+    assert "not available" in response.text.lower()
+    assert database.email_verification_relay_expires_at(tenant.id, now=datetime.now(UTC).isoformat()) is None
 
 
 def test_sender_routes_need_a_session_and_same_origin(web):

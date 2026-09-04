@@ -8,7 +8,7 @@ import sqlite3
 import zipfile
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from urllib.parse import unquote
 
 import httpx
@@ -20,6 +20,7 @@ from steepd.db import Database
 from steepd.epub import ServiceStorageFull
 from steepd.imagefetch import FetchedImage, ImageFetchError
 from steepd.inbound import (
+    EMAIL_VERIFICATION_SUBJECT_PREFIX,
     REJECTION_REPLY_WINDOW,
     RESEND_ATTACHMENT_HOST,
     RESEND_ATTACHMENT_HOSTS,
@@ -41,6 +42,7 @@ from steepd.urlarticle import UrlArticleError
 WEBHOOK_SECRET = "whsec_" + base64.b64encode(b"steepd-tenant-test-webhook-secre").decode()
 API_KEY = "re_test_api_key"
 INBOX_DOMAIN = "read.steepd.app"
+MAIL_FROM = "Steepd <noreply@steepd.app>"
 
 # convert_newsletter rejects a body with under 80 visible characters and no images
 # (newsletter.py:604). That gate is product behaviour, so the fixtures use prose long
@@ -1435,6 +1437,165 @@ def test_stored_email_addressed_to_another_tenant_is_rejected(inbound_env_two_te
     assert database.count_items(bob_scope) == 0
 
 
+# -- temporary email-verification relay ----------------------------------
+
+
+def _verification_env(tmp_path, inboxes: Sequence[str] = ("a.1",)):
+    return _build_env(tmp_path, inboxes, mail_from_address=MAIL_FROM)
+
+
+def _arm_verification_relay(database: Database, tenant_id: str) -> str:
+    expires_at = (datetime.now(UTC) + timedelta(minutes=5)).isoformat()
+    assert database.enable_email_verification_relay(tenant_id, expires_at=expires_at)
+    return expires_at
+
+
+def test_an_armed_verification_relay_forwards_the_next_email_before_sender_policy(tmp_path):
+    _, database, _, service, tenants, provider = _verification_env(tmp_path)
+    tenant = tenants[0]
+    database.set_sender_policy(tenant.id, "listed")
+    _arm_verification_relay(database, tenant.id)
+    provider.queue_email(
+        to="a.1@read.steepd.app",
+        sender="Google Forwarding <forwarding-noreply@google.com>",
+        subject="Gmail Forwarding Confirmation",
+        text="Use this link to confirm forwarding.",
+        svix_id="msg_verify",
+    )
+
+    result = service.handle(*provider.signed_event())
+
+    assert result.status == "ok"
+    assert result.message == "Forwarded an email-verification message."
+    assert result.tenant_id == tenant.id
+    assert database.count_items(TenantScope(tenant.id)) == 0
+    assert database.list_refused_senders(tenant.id) == []
+    assert webhook_result(database, "msg_verify") == "email-verification-relayed"
+    assert database.email_verification_relay_expires_at(
+        tenant.id, now=datetime.now(UTC).isoformat()
+    ) is None
+
+    assert len(provider.forwards) == 1
+    forward = provider.forwards[0]
+    assert forward["to"] == [tenant.email]
+    assert forward["from"] == MAIL_FROM
+    assert forward["subject"] == EMAIL_VERIFICATION_SUBJECT_PREFIX + "Gmail Forwarding Confirmation"
+    assert forward["text"] == "Use this link to confirm forwarding."
+    assert forward["reply_to"] == ["Google Forwarding <forwarding-noreply@google.com>"]
+
+
+def test_verification_relay_is_one_shot_and_normal_delivery_resumes(tmp_path):
+    _, database, _, service, tenants, provider = _verification_env(tmp_path)
+    tenant = tenants[0]
+    _arm_verification_relay(database, tenant.id)
+    provider.queue_email(to="a.1@read.steepd.app", subject="Verify", text="First message")
+    assert service.handle(*provider.signed_event()).status == "ok"
+
+    provider.queue_email(
+        to="a.1@read.steepd.app",
+        sender=tenant.email,
+        subject="Fwd: Monday note",
+        html=ARTICLE_BODY,
+    )
+    second = service.handle(*provider.signed_event())
+
+    assert second.imported == 1
+    assert database.count_items(TenantScope(tenant.id), kind="article") == 1
+    assert len(provider.forwards) == 1
+
+
+def test_an_expired_verification_relay_does_not_forward(tmp_path):
+    _, database, _, service, tenants, provider = _verification_env(tmp_path)
+    tenant = tenants[0]
+    database.enable_email_verification_relay(
+        tenant.id, expires_at=(datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+    )
+    provider.queue_email(
+        to="a.1@read.steepd.app",
+        sender=tenant.email,
+        subject="Fwd: Monday note",
+        html=ARTICLE_BODY,
+    )
+
+    result = service.handle(*provider.signed_event())
+
+    assert result.imported == 1
+    assert provider.forwards == []
+
+
+def test_a_failed_verification_forward_releases_the_window_for_webhook_retry(tmp_path):
+    _, database, _, service, tenants, provider = _verification_env(tmp_path)
+    tenant = tenants[0]
+    _arm_verification_relay(database, tenant.id)
+    provider.forward_status = 500
+    provider.queue_email(
+        to="a.1@read.steepd.app",
+        subject="Forwarding confirmation",
+        text="Confirm me.",
+        svix_id="msg_verify_retry",
+    )
+    body, headers = provider.signed_event()
+
+    with pytest.raises(ProviderRequestError):
+        service.handle(body, headers)
+
+    assert webhook_result(database, "msg_verify_retry") == ""
+    assert database.email_verification_relay_expires_at(
+        tenant.id, now=datetime.now(UTC).isoformat()
+    ) is not None
+
+    provider.forward_status = 200
+    result = service.handle(body, headers)
+
+    assert result.status == "ok"
+    assert len(provider.forwards) == 2
+    assert database.email_verification_relay_expires_at(
+        tenant.id, now=datetime.now(UTC).isoformat()
+    ) is None
+
+
+def test_verification_relay_rechecks_the_stored_recipient_before_forwarding(tmp_path):
+    _, database, _, service, tenants, provider = _verification_env(tmp_path, ("a.1", "b.2"))
+    alice = tenants[0]
+    _arm_verification_relay(database, alice.id)
+    provider.queue_email(
+        to="a.1@read.steepd.app",
+        subject="Forwarding confirmation",
+        text="Confirm me.",
+        svix_id="msg_verify_mismatch",
+    )
+    provider.emails["email-1"]["to"] = ["b.2@read.steepd.app"]
+
+    with pytest.raises(InvalidWebhookEvent):
+        service.handle(*provider.signed_event())
+
+    assert provider.forwards == []
+    assert webhook_result(database, "msg_verify_mismatch") == ""
+    assert database.email_verification_relay_expires_at(
+        alice.id, now=datetime.now(UTC).isoformat()
+    ) is not None
+
+
+def test_verification_relay_is_scoped_to_its_tenant(tmp_path):
+    _, database, _, service, tenants, provider = _verification_env(tmp_path, ("a.1", "b.2"))
+    alice, bob = tenants
+    alice_expiry = _arm_verification_relay(database, alice.id)
+    provider.queue_email(
+        to="b.2@read.steepd.app",
+        sender=bob.email,
+        subject="Fwd: Monday note",
+        html=ARTICLE_BODY,
+    )
+
+    result = service.handle(*provider.signed_event())
+
+    assert result.tenant_id == bob.id and result.imported == 1
+    assert provider.forwards == []
+    assert database.email_verification_relay_expires_at(
+        alice.id, now=datetime.now(UTC).isoformat()
+    ) == alice_expiry
+
+
 # -- support forwarding ---------------------------------------------------
 # Resend delivers a webhook for every address on the account's receiving domains, so the
 # apex support address arrives here alongside the tenant inboxes on INBOX_DOMAIN. It is
@@ -1442,7 +1603,6 @@ def test_stored_email_addressed_to_another_tenant_is_rejected(inbound_env_two_te
 
 SUPPORT_ADDRESS = "help@steepd.app"
 FORWARD_ADDRESS = "operator@example.com"
-MAIL_FROM = "Steepd <noreply@steepd.app>"
 
 
 def _support_env(tmp_path, **settings_overrides):

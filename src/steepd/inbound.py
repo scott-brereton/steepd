@@ -74,6 +74,7 @@ PROCESSING_RESULT = "processing"
 # Marks a relayed message in the operator's mailbox, where it arrives from our own
 # MAIL_FROM_ADDRESS rather than from whoever wrote in.
 SUPPORT_SUBJECT_PREFIX = "[Steepd support] "
+EMAIL_VERIFICATION_SUBJECT_PREFIX = "[Steepd email verification] "
 REJECTION_SUBJECT_PREFIX = "Steepd could not file: "
 
 # The rejection reply is the one thing an unauthenticated stranger can make this service
@@ -201,7 +202,15 @@ class InboundEmailProvider(Protocol):
 
     def download_chunks(self, attachment: InboundAttachment) -> AbstractContextManager[Iterable[bytes]]: ...
 
-    def forward_email(self, email_id: str, *, to: str, sender: str) -> None: ...
+    def forward_email(
+        self,
+        email_id: str,
+        *,
+        to: str,
+        sender: str,
+        subject_prefix: str = SUPPORT_SUBJECT_PREFIX,
+        expected_recipient: str = "",
+    ) -> None: ...
 
 
 class ResendInboundProvider:
@@ -364,7 +373,15 @@ class ResendInboundProvider:
             message_id=(message_id or "")[:1000],
         )
 
-    def forward_email(self, email_id: str, *, to: str, sender: str) -> None:
+    def forward_email(
+        self,
+        email_id: str,
+        *,
+        to: str,
+        sender: str,
+        subject_prefix: str = SUPPORT_SUBJECT_PREFIX,
+        expected_recipient: str = "",
+    ) -> None:
         """Re-deliver a received email to `to`, sent from our own verified `sender`.
 
         Resend has no server-side forward route. `resend.emails.receiving.forward()` in the
@@ -385,10 +402,18 @@ class ResendInboundProvider:
             raise ProviderRequestError("Forward sender is not configured")
 
         email = self.get_email(email_id)
+        normalized_expected_recipient = _normalize_address(expected_recipient)
+        if normalized_expected_recipient and not any(
+            _normalize_address(recipient) == normalized_expected_recipient for recipient in email.recipients
+        ):
+            # The webhook and the message lookup are separate provider responses. Never
+            # forward the looked-up message merely because the webhook said it belonged
+            # to this address; re-check the object whose body is about to leave.
+            raise InvalidWebhookEvent("Stored inbound email is not addressed to the expected recipient")
         payload: dict[str, object] = {
             "from": sender,
             "to": [to],
-            "subject": (SUPPORT_SUBJECT_PREFIX + email.subject)[:MAX_SUBJECT_LENGTH],
+            "subject": (subject_prefix + email.subject)[:MAX_SUBJECT_LENGTH],
             "reply_to": [email.sender],
         }
         if email.html:
@@ -679,6 +704,20 @@ class InboundEmailService:
             self._record(event_id, "unknown-inbox")
             return InboundResult("ignored", "Recipient does not match a known inbox.")
 
+        email_id = data.get("email_id")
+        if (
+            isinstance(email_id, str)
+            and email_id
+            and len(email_id) <= 200
+            and self.settings.mail_from_address
+            and self.database.claim_email_verification_relay(
+                tenant.id,
+                event_id=event_id,
+                now=datetime.now(UTC).isoformat(),
+            )
+        ):
+            return self._forward_email_verification(tenant, event_id=event_id, email_id=email_id)
+
         sender = _normalize_address(data.get("from"))
         if not self.database.is_sender_allowed(tenant, sender):
             # Nothing is sent to anyone. A reply to the sender would make every inbox an
@@ -690,7 +729,6 @@ class InboundEmailService:
             self._record(event_id, "sender-refused")
             return InboundResult("ignored", "Sender is not allowed for this inbox.")
 
-        email_id = data.get("email_id")
         if not isinstance(email_id, str) or not email_id or len(email_id) > 200:
             raise InvalidWebhookEvent("Inbound email ID is missing")
 
@@ -805,6 +843,43 @@ class InboundEmailService:
                 return True
         return False
 
+    def _forward_email_verification(
+        self,
+        tenant: Tenant,
+        *,
+        event_id: str,
+        email_id: str,
+    ) -> InboundResult:
+        """Spend a claimed one-shot window by relaying its message to the account owner.
+
+        The claim is released on any failure so the provider can retry the same webhook
+        during the remaining window. Completion is event-scoped: if the owner re-arms the
+        checkbox while this send is in flight, the old webhook cannot consume the new
+        window when it finishes.
+        """
+        assert self.provider is not None
+        expected_recipient = f"{tenant.inbox_local}@{self.settings.inbox_domain}"
+        try:
+            self.provider.forward_email(
+                email_id,
+                to=tenant.email,
+                sender=self.settings.mail_from_address,
+                subject_prefix=EMAIL_VERIFICATION_SUBJECT_PREFIX,
+                expected_recipient=expected_recipient,
+            )
+        except Exception:
+            self.database.release_email_verification_relay(tenant.id, event_id=event_id)
+            raise
+
+        self.database.complete_email_verification_relay(tenant.id, event_id=event_id)
+        self._record(event_id, "email-verification-relayed")
+        LOGGER.info("Forwarded an email-verification message for tenant=%s email_id=%s", tenant.id, email_id)
+        return InboundResult(
+            "ok",
+            "Forwarded an email-verification message.",
+            tenant_id=tenant.id,
+        )
+
     def _forward_to_support(self, event_id: str, data: Mapping[str, object]) -> InboundResult | None:
         """Relay mail addressed to the support address, or None if this is not support mail.
 
@@ -843,7 +918,13 @@ class InboundEmailService:
 
         assert self.provider is not None
         try:
-            self.provider.forward_email(email_id, to=forward_address, sender=mail_from)
+            self.provider.forward_email(
+                email_id,
+                to=forward_address,
+                sender=mail_from,
+                subject_prefix=SUPPORT_SUBJECT_PREFIX,
+                expected_recipient=support_address,
+            )
         except ProviderRequestError as exc:
             # str(exc) is safe to log: the provider keeps recipients, subjects and bodies
             # out of its messages. Returning success is deliberate -- a Resend retry would
