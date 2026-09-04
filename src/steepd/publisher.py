@@ -57,6 +57,8 @@ class LocalNewsletterPublisher:
         document: NewsletterDocument,
         resources: Sequence[NewsletterResource],
         labels: tuple[str, ...],
+        *,
+        source: str = "newsletter",
     ) -> str:
         body_html, packaged = self._package_resources(document, resources)
         payload = build_epub(
@@ -72,7 +74,7 @@ class LocalNewsletterPublisher:
             payload,
             filename=sanitize_filename(f"{document.title}.epub", fallback_title="article"),
             kind="article",
-            source="newsletter",
+            source=source,
             source_url=document.source_url,
             title=document.title,
             author=document.author,

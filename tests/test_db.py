@@ -8,6 +8,8 @@ import pytest
 from steepd import db as db_module
 from steepd.db import MAX_ALLOWED_SENDERS, MAX_REFUSED_SENDERS, SCHEMA_VERSION, AllowedSenderCapReached, Database
 from steepd.inboxnames import is_placeholder
+from steepd.models import Item
+from steepd.tenancy import TenantScope
 
 NOW = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
 
@@ -235,3 +237,39 @@ def test_reads_and_writes_do_not_leak_file_descriptors(database):
         database.health()
         database.set_sender_policy(tenant.id, "anyone")
     assert _open_descriptors() - before <= 3
+
+
+def _item(item_id: str, tenant_id: str, *, title: str, source: str) -> Item:
+    return Item(
+        id=item_id,
+        tenant_id=tenant_id,
+        kind="article",
+        sha256=item_id.ljust(64, "0"),
+        storage_name=f"{item_id}.epub",
+        download_filename=f"{title}.epub",
+        title=title,
+        author="",
+        language="en",
+        identifier=f"urn:test:{item_id}",
+        source_url="https://example.com/story",
+        size_bytes=100,
+        created_at=NOW.isoformat(),
+        expires_at=None,
+        source=source,
+    )
+
+
+def test_item_titles_are_scoped_to_the_tenant_and_requested_source(database):
+    """Another tenant's save and this tenant's newsletter must not consume a numeric
+    suffix intended only for this tenant's current Saved items."""
+    alice = database.create_tenant(email="alice@example.com", inbox_local="alice")
+    bob = database.create_tenant(email="bob@example.com", inbox_local="bob")
+    alice_scope = TenantScope(alice.id)
+    bob_scope = TenantScope(bob.id)
+    database.insert_item(alice_scope, _item("alice-url-1", alice.id, title="Story", source="url"))
+    database.insert_item(alice_scope, _item("alice-url-2", alice.id, title="Story (2)", source="url"))
+    database.insert_item(alice_scope, _item("alice-news", alice.id, title="Newsletter title", source="newsletter"))
+    database.insert_item(bob_scope, _item("bob-url", bob.id, title="Bob's story", source="url"))
+
+    assert database.list_item_titles(alice_scope, source="url") == ["Story", "Story (2)"]
+    assert database.list_item_titles(alice_scope, source="newsletter") == ["Newsletter title"]

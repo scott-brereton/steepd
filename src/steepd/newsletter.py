@@ -20,6 +20,10 @@ class NewsletterConversionError(NewsletterError):
     pass
 
 
+class NewsletterSizeError(NewsletterConversionError):
+    """The readable input was valid but its converted output exceeded a size limit."""
+
+
 class NewsletterForwardingError(NewsletterError):
     pass
 
@@ -86,6 +90,8 @@ class NewsletterPublisher(Protocol):
         document: NewsletterDocument,
         resources: Sequence[NewsletterResource],
         labels: tuple[str, ...],
+        *,
+        source: str = "newsletter",
     ) -> str: ...
 
 
@@ -536,28 +542,19 @@ def _sanitize_attributes(root: Tag | BeautifulSoup) -> None:
         tag.attrs = {key: value for key, value in tag.attrs.items() if key.casefold() in allowed}
 
 
-def convert_newsletter(
-    email: NewsletterEmail,
+def _clean_article_body(
+    body: Tag | BeautifulSoup,
     *,
+    title: str,
+    author: str,
+    source_url: str,
+    created_at: str,
+    document_key: str,
     public_base_url: str,
     inline_image_types: Mapping[str, str] | None = None,
     max_output_bytes: int = 5 * 1024 * 1024,
     fetch_remote_image: RemoteImageFetcher | None = None,
 ) -> NewsletterDocument:
-    title = clean_newsletter_title(email.subject)
-    raw_html = email.html.strip()
-    if raw_html:
-        original = BeautifulSoup(raw_html, "html.parser")
-    elif email.text.strip():
-        original = _plain_text_fragment(email.text)
-    else:
-        raise NewsletterConversionError("Inbound newsletter has no HTML or text body")
-
-    source_url = _find_source_url(original, title)
-    author = _article_author(original, email)
-    fragment = _forwarded_fragment(original)
-    body: Tag | BeautifulSoup = fragment.body or fragment
-
     for comment in list(body.find_all(string=lambda value: isinstance(value, Comment))):
         comment.extract()
     for tag in list(body.find_all(True)):
@@ -603,7 +600,9 @@ def convert_newsletter(
                 continue
             reference = inline_by_content_id.get(content_id)
             if reference is None:
-                location = f"{public_base_url}/newsletters/{quote(email.id, safe='')}/inline/{len(inline_images) + 1}"
+                location = (
+                    f"{public_base_url}/newsletters/{quote(document_key, safe='')}/inline/{len(inline_images) + 1}"
+                )
                 reference = InlineImageReference(content_id, location, content_type)
                 inline_images.append(reference)
                 inline_by_content_id[content_id] = reference
@@ -630,7 +629,7 @@ def convert_newsletter(
                         # substitution anchored on the whole src attribute, because a location
                         # ending in /1 is a prefix of one ending in /10 (publisher.py).
                         location = (
-                            f"{public_base_url}/newsletters/{quote(email.id, safe='')}"
+                            f"{public_base_url}/newsletters/{quote(document_key, safe='')}"
                             f"/remote/{len(remote_resources) + 1}"
                         )
                         fetched_resource = NewsletterResource(location, content_type, content)
@@ -689,7 +688,7 @@ def convert_newsletter(
     output_html = str(output)
     output_bytes = output_html.encode("utf-8")
     if len(output_bytes) > max_output_bytes:
-        raise NewsletterConversionError("Converted newsletter exceeds the configured body-size limit")
+        raise NewsletterSizeError("Converted newsletter exceeds the configured body-size limit")
 
     # Both placeholder families collapse to one token so the hash does not depend on how the
     # images happened to be numbered. Remote images make this dedupe looser than it looks: two
@@ -697,7 +696,7 @@ def convert_newsletter(
     # a placeholder where the other stores alt text and the hashes differ. content_sha256 is
     # therefore best-effort; email_id and message_id remain the exact dedupe keys.
     canonical_for_hash = re.sub(
-        rf"{re.escape(public_base_url)}/newsletters/{re.escape(quote(email.id, safe=''))}/(?:inline|remote)/\d+",
+        rf"{re.escape(public_base_url)}/newsletters/{re.escape(quote(document_key, safe=''))}/(?:inline|remote)/\d+",
         "cid:inline-image",
         output_html,
     )
@@ -708,7 +707,7 @@ def convert_newsletter(
         html=output_html,
         source_url=source_url,
         author=author,
-        created_at=email.created_at[:64],
+        created_at=created_at[:64],
         content_sha256=content_sha256,
         inline_images=tuple(inline_images),
         stats=NewsletterConversionStats(
@@ -724,4 +723,69 @@ def convert_newsletter(
             remote_images_failed=remote_failed,
         ),
         remote_resources=tuple(remote_resources),
+    )
+
+
+def clean_article_html(
+    raw_html: str,
+    *,
+    title: str,
+    author: str,
+    source_url: str,
+    created_at: str,
+    document_key: str,
+    public_base_url: str,
+    max_output_bytes: int = 5 * 1024 * 1024,
+    fetch_remote_image: RemoteImageFetcher | None = None,
+) -> NewsletterDocument:
+    """Clean extracted webpage HTML through the same rules used for newsletters."""
+    if not raw_html.strip():
+        raise NewsletterConversionError("Extracted webpage has no readable HTML")
+    original = BeautifulSoup(raw_html, "html.parser")
+    body: Tag | BeautifulSoup = original.body or original
+    return _clean_article_body(
+        body,
+        title=title,
+        author=author,
+        source_url=source_url,
+        created_at=created_at,
+        document_key=document_key,
+        public_base_url=public_base_url,
+        max_output_bytes=max_output_bytes,
+        fetch_remote_image=fetch_remote_image,
+    )
+
+
+def convert_newsletter(
+    email: NewsletterEmail,
+    *,
+    public_base_url: str,
+    inline_image_types: Mapping[str, str] | None = None,
+    max_output_bytes: int = 5 * 1024 * 1024,
+    fetch_remote_image: RemoteImageFetcher | None = None,
+) -> NewsletterDocument:
+    title = clean_newsletter_title(email.subject)
+    raw_html = email.html.strip()
+    if raw_html:
+        original = BeautifulSoup(raw_html, "html.parser")
+    elif email.text.strip():
+        original = _plain_text_fragment(email.text)
+    else:
+        raise NewsletterConversionError("Inbound newsletter has no HTML or text body")
+
+    source_url = _find_source_url(original, title)
+    author = _article_author(original, email)
+    fragment = _forwarded_fragment(original)
+    body: Tag | BeautifulSoup = fragment.body or fragment
+    return _clean_article_body(
+        body,
+        title=title,
+        author=author,
+        source_url=source_url,
+        created_at=email.created_at,
+        document_key=email.id,
+        public_base_url=public_base_url,
+        inline_image_types=inline_image_types,
+        max_output_bytes=max_output_bytes,
+        fetch_remote_image=fetch_remote_image,
     )

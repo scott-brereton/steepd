@@ -763,7 +763,7 @@ def _account_page(
         f"{_notice(error)}"
         "<h1>Your account</h1>"
         f"{_plan_card(tenant, storage_bytes, retention)}"
-        f'<div class="card"><span class="label">Send books and newsletters here</span>'
+        f'<div class="card"><span class="label">Send books, newsletters, and links here</span>'
         f"<code>{html.escape(inbox_address)}</code></div>"
         f'<div class="card"><span class="label">Catalogue address for your reader</span>'
         f"<code>{html.escape(catalogue_url)}</code></div>"
@@ -802,64 +802,76 @@ def _account_page(
 # Every number quoted below is derived from steepd.plans rather than written out, because
 # a page that says "100 MB" while the quota says something else is worse than no page.
 
-# Hand-tuned geometry: two source shapes on the left, the service in the middle, a reader
+# Hand-tuned geometry: three source shapes on the left, the service in the middle, a reader
 # on the right. Inline rather than an <img> because the CSP serves no images and an
 # external one would be the single request that made this page phone anywhere.
 _DIAGRAM = """
 <div class="diagram">
-<svg viewBox="0 0 660 250" role="img"
-aria-label="A forwarded newsletter or an emailed EPUB goes to Steepd, which delivers it to your e-reader's catalogue.">
+<svg viewBox="0 0 660 300" role="img"
+aria-label="A forwarded newsletter, a webpage URL in the email subject, or an attached EPUB
+goes to Steepd, which delivers it to your e-reader's catalogue.">
 <defs>
 <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7"
 orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#B6AFA5"/></marker>
 </defs>
-<g transform="translate(0,52)">
-<rect x="0" y="0" width="176" height="60" rx="10" fill="#FFFDFA" stroke="#E2DCD2"/>
-<rect x="18" y="19" width="30" height="22" rx="3" fill="none" stroke="#8B5E3C" stroke-width="1.8"/>
-<path d="M18 21 L33 32 L48 21" fill="none" stroke="#8B5E3C" stroke-width="1.8" stroke-linecap="round"/>
-<text x="62" y="26" font-family="ui-rounded,-apple-system,system-ui,sans-serif"
+<g transform="translate(0,22)">
+<rect x="0" y="0" width="176" height="56" rx="10" fill="#FFFDFA" stroke="#E2DCD2"/>
+<rect x="18" y="17" width="30" height="22" rx="3" fill="none" stroke="#8B5E3C" stroke-width="1.8"/>
+<path d="M18 19 L33 30 L48 19" fill="none" stroke="#8B5E3C" stroke-width="1.8" stroke-linecap="round"/>
+<text x="62" y="24" font-family="ui-rounded,-apple-system,system-ui,sans-serif"
 font-size="14" font-weight="600" fill="#1A1A2E">Newsletter</text>
-<text x="62" y="44" font-family="-apple-system,system-ui,sans-serif"
+<text x="62" y="42" font-family="-apple-system,system-ui,sans-serif"
 font-size="12.5" fill="#8A857E">you forward it</text>
 </g>
-<g transform="translate(0,138)">
-<rect x="0" y="0" width="176" height="60" rx="10" fill="#FFFDFA" stroke="#E2DCD2"/>
-<rect x="20" y="17" width="26" height="26" rx="3" fill="none" stroke="#8B5E3C" stroke-width="1.8"/>
-<path d="M26 25 h14 M26 30 h14 M26 35 h9" stroke="#8B5E3C" stroke-width="1.6" stroke-linecap="round"/>
-<text x="62" y="26" font-family="ui-rounded,-apple-system,system-ui,sans-serif"
+<g transform="translate(0,114)">
+<rect x="0" y="0" width="176" height="56" rx="10" fill="#FFFDFA" stroke="#E2DCD2"/>
+<path d="M22 28 h20 M35 18 l10 10 -10 10" fill="none" stroke="#8B5E3C" stroke-width="1.8"
+stroke-linecap="round" stroke-linejoin="round"/>
+<text x="62" y="24" font-family="ui-rounded,-apple-system,system-ui,sans-serif"
+font-size="14" font-weight="600" fill="#1A1A2E">Webpage</text>
+<text x="62" y="42" font-family="-apple-system,system-ui,sans-serif"
+font-size="12.5" fill="#8A857E">link in subject</text>
+</g>
+<g transform="translate(0,206)">
+<rect x="0" y="0" width="176" height="56" rx="10" fill="#FFFDFA" stroke="#E2DCD2"/>
+<rect x="20" y="15" width="26" height="26" rx="3" fill="none" stroke="#8B5E3C" stroke-width="1.8"/>
+<path d="M26 23 h14 M26 28 h14 M26 33 h9" stroke="#8B5E3C" stroke-width="1.6" stroke-linecap="round"/>
+<text x="62" y="24" font-family="ui-rounded,-apple-system,system-ui,sans-serif"
 font-size="14" font-weight="600" fill="#1A1A2E">EPUB</text>
-<text x="62" y="44" font-family="-apple-system,system-ui,sans-serif"
+<text x="62" y="42" font-family="-apple-system,system-ui,sans-serif"
 font-size="12.5" fill="#8A857E">you attach it</text>
 </g>
-<path d="M184 82 C 214 82, 214 118, 244 122" fill="none" stroke="#B6AFA5" stroke-width="1.8" marker-end="url(#a)"/>
-<path d="M184 168 C 214 168, 214 132, 244 128" fill="none" stroke="#B6AFA5" stroke-width="1.8" marker-end="url(#a)"/>
-<g transform="translate(258,88)">
+<path d="M184 50 C 218 50, 214 133, 244 142" fill="none" stroke="#B6AFA5" stroke-width="1.8" marker-end="url(#a)"/>
+<path d="M184 142 H 244" fill="none" stroke="#B6AFA5" stroke-width="1.8" marker-end="url(#a)"/>
+<path d="M184 234 C 218 234, 214 151, 244 142" fill="none" stroke="#B6AFA5" stroke-width="1.8" marker-end="url(#a)"/>
+<g transform="translate(258,105)">
 <rect x="0" y="0" width="124" height="74" rx="12" fill="#FBF7F2" stroke="#6B4226" stroke-width="1.5"/>
 <path d="M69 19 A12 12 0 1 0 73.5 27" fill="none" stroke="#6B4226" stroke-width="2.6" stroke-linecap="round"/>
 <text x="62" y="58" text-anchor="middle" font-family="ui-rounded,-apple-system,system-ui,sans-serif"
 font-size="13.5" font-weight="600" fill="#6B4226" letter-spacing="0.5">steepd</text>
 </g>
-<text x="320" y="182" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif"
+<text x="320" y="198" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif"
 font-size="12.5" fill="#8A857E">cleans it up</text>
-<text x="320" y="199" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif"
+<text x="320" y="215" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif"
 font-size="12.5" fill="#8A857E">about a minute</text>
-<path d="M390 125 H 448" fill="none" stroke="#B6AFA5" stroke-width="1.8" marker-end="url(#a)"/>
-<g transform="translate(462,34)">
-<rect x="0" y="0" width="128" height="182" rx="14" fill="#1A1A2E"/>
-<rect x="9" y="9" width="110" height="150" rx="6" fill="#F5F2ED"/>
-<circle cx="64" cy="171" r="5" fill="none" stroke="#4A4560" stroke-width="1.6"/>
+<path d="M390 142 H 448" fill="none" stroke="#B6AFA5" stroke-width="1.8" marker-end="url(#a)"/>
+<g transform="translate(462,28)">
+<rect x="0" y="0" width="128" height="220" rx="14" fill="#1A1A2E"/>
+<rect x="9" y="9" width="110" height="184" rx="6" fill="#F5F2ED"/>
+<circle cx="64" cy="207" r="5" fill="none" stroke="#4A4560" stroke-width="1.6"/>
 <text x="20" y="32" font-family="ui-rounded,-apple-system,system-ui,sans-serif"
 font-size="11.5" font-weight="700" fill="#1A1A2E">Steepd</text>
 <line x1="20" y1="40" x2="108" y2="40" stroke="#E2DCD2" stroke-width="1"/>
 <text x="20" y="60" font-family="-apple-system,system-ui,sans-serif" font-size="11" fill="#4A453E">Recent</text>
-<text x="20" y="84" font-family="-apple-system,system-ui,sans-serif" font-size="11" fill="#4A453E">Newsletters</text>
-<text x="20" y="108" font-family="-apple-system,system-ui,sans-serif" font-size="11" fill="#4A453E">Books</text>
-<path d="M99 56 l4 4 -4 4 M99 80 l4 4 -4 4 M99 104 l4 4 -4 4" fill="none" stroke="#B6AFA5"
+<text x="20" y="84" font-family="-apple-system,system-ui,sans-serif" font-size="11" fill="#4A453E">Saved</text>
+<text x="20" y="108" font-family="-apple-system,system-ui,sans-serif" font-size="11" fill="#4A453E">Newsletters</text>
+<text x="20" y="132" font-family="-apple-system,system-ui,sans-serif" font-size="11" fill="#4A453E">Books</text>
+<path d="M99 56 l4 4 -4 4 M99 80 l4 4 -4 4 M99 104 l4 4 -4 4 M99 128 l4 4 -4 4" fill="none" stroke="#B6AFA5"
 stroke-width="1.4" stroke-linecap="round"/>
-<rect x="20" y="126" width="88" height="6" rx="3" fill="#D4A96A" opacity="0.55"/>
-<rect x="20" y="138" width="60" height="6" rx="3" fill="#D4A96A" opacity="0.35"/>
+<rect x="20" y="150" width="88" height="6" rx="3" fill="#D4A96A" opacity="0.55"/>
+<rect x="20" y="162" width="60" height="6" rx="3" fill="#D4A96A" opacity="0.35"/>
 </g>
-<text x="526" y="238" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif"
+<text x="526" y="278" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif"
 font-size="12.5" fill="#8A857E">your catalogue</text>
 </svg>
 </div>
@@ -931,8 +943,9 @@ def _walkthrough(inbox_domain: str) -> str:
     named = f"@{html.escape(inbox_domain)} address" if inbox_domain else "Steepd address"
     return (
         '<figure class="walk">'
-        f'<figcaption class="walk-caption">See how it works: forward any email to your {named} '
-        "and it appears on your e&#8209;reader; EPUB attachments are filed as books.</figcaption>"
+        f'<figcaption class="walk-caption">See how it works: forward a newsletter to your {named}, '
+        "put one webpage URL alone in Subject, or attach a book; EPUB attachments are filed as books."
+        "</figcaption>"
         "<details><summary>"
         '<span class="walk-say">Show me how it works</span>'
         '<span class="walk-hide">Hide the walkthrough</span>'
@@ -959,7 +972,8 @@ def _walkthrough(inbox_domain: str) -> str:
         '<div class="walk-row"><span class="walk-key">To</span><span class="walk-val">'
         f'<span class="walk-type" style="--tw:{len(address)}ch">{html.escape(address)}</span>'
         "</span></div>"
-        '<div class="walk-note"><p class="walk-hint">Your Steepd address</p></div>'
+        '<div class="walk-note"><p class="walk-hint">Your Steepd address — to save a webpage, '
+        "start a blank email and put only its URL in Subject.</p></div>"
         '<div class="walk-row"><span class="walk-key">Subject</span>'
         '<span class="walk-val">Fwd: Issue #42</span></div>'
         '<div class="walk-act"><label class="walk-go walk-late" for="walk-3">Send</label></div>'
@@ -977,6 +991,8 @@ def _walkthrough(inbox_domain: str) -> str:
         "<div>"
         '<p class="walk-hint">The Weekly Dispatch — Issue #42, now the top entry in your catalogue.</p>'
         '<p class="walk-done">Simple, right?</p>'
+        "<p>For a link, start a blank email, put one webpage URL alone in the subject, "
+        f"and send it to your {named}. It appears in Saved.</p>"
         f"<p>Books work the same way — attach the EPUB to an email to your {named}.</p>"
         "</div></div>"
         '<div class="walk-act"><label class="walk-restart" for="walk-1">Start over</label></div>'
@@ -1041,12 +1057,15 @@ def _landing_page(*, source_url: str = "", inbox_domain: str = "") -> HTMLRespon
         "<section><h2>Setup</h2>"
         '<p class="small">You get an address to email things to, and a feed address. Type the '
         "feed into your reader once. No app, no plugin, no cable.</p>"
-        '<p class="small"><strong>Attachment means book. No attachment means article.</strong></p>'
+        '<p class="small">Forward a newsletter, put one webpage URL alone in the email subject, '
+        "or attach an EPUB.</p>"
+        '<p class="small"><strong>EPUB attached means book. A lone subject URL means Saved article. '
+        "Anything else means newsletter.</strong></p>"
         "</section>"
-        "<section><h2>Newsletters that read like articles</h2>"
-        '<p class="small">Most converters hand your reader a narrow column of nested email tables. '
-        "Steepd flattens them, keeps the tables holding real data, drops the tracking pixels, and "
-        "stores images in the file so it works offline.</p></section>"
+        "<section><h2>Newsletters and webpages that read like articles</h2>"
+        '<p class="small">Steepd pulls the readable part from public webpages and flattens the nested '
+        "tables in email newsletters. It keeps tables holding real data, drops tracking pixels, and "
+        "stores images in the file so everything works offline.</p></section>"
         f"<section><h2>Pricing</h2>{_tiers()}"
         '<p class="small muted">Paid plans arrive after the beta. Libraries built during the beta '
         "carry over.</p></section>"
@@ -1103,11 +1122,13 @@ def _privacy_page(*, contact: str = "", source_url: str = "") -> HTMLResponse:
         "<section><h2>What we hold</h2>"
         "<p>You sign up with an email address. It is used to send you sign-in links and for nothing "
         "else: no newsletter, no product mail, and it is not passed on.</p>"
-        "<p>When you forward an email to your Steepd address we convert it and store the result as "
-        "an EPUB in your library. That file belongs to your account and is reachable only with your "
+        "<p>When you forward an email or send a public webpage URL to your Steepd address, we convert "
+        "it and store the result as an EPUB in your library. That file belongs to your account and is "
+        "reachable only with your "
         "session or your device password.</p></section>"
         "<section><h2>What publishers can see</h2>"
-        "<p>Images in a newsletter are fetched once, at the moment we convert it, and stored inside "
+        "<p>Public webpage HTML and newsletter or webpage images are fetched once, at the moment we "
+        "convert the item, and stored inside "
         "the EPUB. A publisher can therefore learn that a message was converted, but not when or "
         "whether you read it. Tracking pixels are dropped and tracking parameters are stripped out "
         "of links before the file is built.</p></section>"

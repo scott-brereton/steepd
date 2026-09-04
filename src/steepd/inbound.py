@@ -8,10 +8,10 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from email.utils import parseaddr
-from typing import Protocol
+from typing import Literal, Protocol
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
@@ -19,7 +19,13 @@ from svix.webhooks import Webhook, WebhookVerificationError
 
 from steepd.config import Settings
 from steepd.db import Database
-from steepd.epub import EPUB_MIME_TYPE, EpubImportError
+from steepd.epub import (
+    EPUB_MIME_TYPE,
+    EpubImportError,
+    ServiceStorageFull,
+    StorageQuotaExceeded,
+    UploadTooLarge,
+)
 from steepd.imagefetch import FetchedImage, ImageFetchError, fetch_remote_image
 from steepd.models import Tenant
 from steepd.newsletter import (
@@ -29,6 +35,7 @@ from steepd.newsletter import (
     NewsletterEmail,
     NewsletterForwardingError,
     NewsletterResource,
+    NewsletterSizeError,
     RemoteImageFetcher,
     convert_newsletter,
     normalize_content_id,
@@ -38,6 +45,7 @@ from steepd.publisher import LocalNewsletterPublisher
 from steepd.ratelimit import Policy, RateLimiter
 from steepd.storage import ItemStorage
 from steepd.tenancy import TenantScope
+from steepd.urlarticle import UrlArticleError, UrlArticleTooLarge, convert_url_article, exact_subject_url
 
 LOGGER = logging.getLogger("steepd.inbound")
 RESEND_API_BASE_URL = "https://api.resend.com"
@@ -75,6 +83,49 @@ REJECTION_SUBJECT_PREFIX = "Steepd could not file: "
 REJECTION_REPLY_BUCKET = "rejection-reply"
 REJECTION_REPLY_LIMIT = 5
 REJECTION_REPLY_WINDOW = 3600.0
+
+_EPUB_CONTENT_ACTIONS = (
+    "Attach the actual .epub file, not a download link, cloud shortcut, ZIP, or renamed file.",
+    "Open the EPUB in an e-reader app to confirm the file works, then send it again.",
+)
+_EPUB_SIZE_ACTIONS = (
+    "Send a smaller EPUB file.",
+    *_EPUB_CONTENT_ACTIONS,
+)
+_NEWSLETTER_CONTENT_ACTIONS = (
+    "Forward the complete original message so its readable HTML or text body is included.",
+    "To save a webpage instead, put the full URL alone in the Subject, not the body.",
+    "If forwarding strips the content, paste the readable text into a new email.",
+)
+_NEWSLETTER_SIZE_ACTIONS = (
+    "Forward a version with fewer or smaller images.",
+    *_NEWSLETTER_CONTENT_ACTIONS[:2],
+)
+_URL_CONTENT_ACTIONS = (
+    "Put one complete http:// or https:// URL alone in the Subject, not the email body.",
+    "Use a public article that does not require sign-in, a saved browser session, "
+    "JavaScript-only loading, or paywall access.",
+    "If the page still cannot be extracted, forward or paste its readable content into an email instead.",
+)
+_URL_SIZE_ACTIONS = (
+    "Try the article's print or text-only page if the publisher offers one.",
+    _URL_CONTENT_ACTIONS[0],
+    _URL_CONTENT_ACTIONS[2],
+)
+_CONTENT_ACTIONS = {
+    "epub": _EPUB_CONTENT_ACTIONS,
+    "newsletter": _NEWSLETTER_CONTENT_ACTIONS,
+    "url": _URL_CONTENT_ACTIONS,
+}
+_SIZE_ACTIONS = {
+    "epub": _EPUB_SIZE_ACTIONS,
+    "newsletter": _NEWSLETTER_SIZE_ACTIONS,
+    "url": _URL_SIZE_ACTIONS,
+}
+_REJECTION_CATEGORY_PRIORITY = {"content": 0, "size": 1, "storage": 2, "service": 3}
+
+InputMode = Literal["epub", "newsletter", "url"]
+RejectionCategory = Literal["content", "size", "storage", "service"]
 
 
 class InboundEmailError(RuntimeError):
@@ -123,6 +174,8 @@ class InboundResult:
     # One line per rejection, in words the reader can act on. These are what the reply
     # email carries; they never name a file path, a tenant id or a provider URL.
     reasons: tuple[str, ...] = ()
+    input_mode: InputMode | None = None
+    rejection_category: RejectionCategory | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -134,6 +187,8 @@ class InboundResult:
             "tenant_id": self.tenant_id,
             "kind": self.kind,
             "reasons": list(self.reasons),
+            "input_mode": self.input_mode,
+            "rejection_category": self.rejection_category,
         }
 
 
@@ -403,7 +458,7 @@ class ResendInboundProvider:
     def download_chunks(self, attachment: InboundAttachment) -> Iterator[Iterable[bytes]]:
         self._validate_download_url(attachment.download_url)
         if attachment.size > self.max_download_bytes:
-            raise EpubImportError("EPUB attachment exceeds the configured upload-size limit")
+            raise UploadTooLarge("EPUB attachment exceeds the configured upload-size limit")
         with httpx.Client(
             timeout=httpx.Timeout(60.0, connect=5.0),
             follow_redirects=False,
@@ -422,7 +477,7 @@ class ResendInboundProvider:
                     if content_length:
                         try:
                             if int(content_length) > self.max_download_bytes:
-                                raise EpubImportError("EPUB attachment exceeds the configured upload-size limit")
+                                raise UploadTooLarge("EPUB attachment exceeds the configured upload-size limit")
                         except ValueError as exc:
                             raise ProviderRequestError("Resend attachment download had an invalid length") from exc
                     yield response.iter_bytes(chunk_size=1024 * 1024)
@@ -447,8 +502,15 @@ def _loggable_url(url: str) -> str:
     """Scheme, host and path only. Newsletter image URLs keep their query string so the
     fetch works, and that is exactly where publishers put per-subscriber tokens; a log line
     is not a place for those."""
-    parts = urlsplit(url)
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    try:
+        parts = urlsplit(url)
+        hostname = parts.hostname or ""
+        port = parts.port
+    except ValueError:
+        return "[invalid URL]"
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    netloc = f"{host}:{port}" if port is not None else host
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
 def _normalize_address(value: object) -> str:
@@ -482,6 +544,42 @@ def _is_epub_candidate(attachment: InboundAttachment) -> bool:
     return attachment.filename.casefold().endswith(".epub") or normalized_type == EPUB_MIME_TYPE
 
 
+def _next_saved_title(title: str, existing_titles: Sequence[str]) -> str:
+    """Choose the first current, tenant-scoped Saved title that is not already used."""
+    used = {existing.casefold() for existing in existing_titles}
+    if title.casefold() not in used:
+        return title
+    suffix = 2
+    while f"{title} ({suffix})".casefold() in used:
+        suffix += 1
+    return f"{title} ({suffix})"
+
+
+def _storage_rejection_category(error: EpubImportError) -> RejectionCategory:
+    if isinstance(error, ServiceStorageFull):
+        return "service"
+    if isinstance(error, StorageQuotaExceeded):
+        return "storage"
+    if isinstance(error, UploadTooLarge):
+        return "size"
+    return "content"
+
+
+def _highest_rejection_category(categories: Sequence[RejectionCategory]) -> RejectionCategory | None:
+    return max(categories, key=_REJECTION_CATEGORY_PRIORITY.__getitem__) if categories else None
+
+
+def _rejection_actions(result: InboundResult) -> tuple[str, ...]:
+    if result.rejection_category == "storage":
+        return ("Delete an item from your library, then send this again.",)
+    if result.rejection_category == "service":
+        return ("Try sending it again later.",)
+    choices = _SIZE_ACTIONS if result.rejection_category == "size" else _CONTENT_ACTIONS
+    if result.input_mode is None:
+        return ()
+    return tuple(choices.get(result.input_mode, ()))[:3]
+
+
 @dataclass(slots=True)
 class _RemoteImageBudget:
     """What one delivery has left to spend on remote images.
@@ -507,6 +605,7 @@ class InboundEmailService:
         provider: InboundEmailProvider | None,
         *,
         image_fetch: Callable[..., FetchedImage] | None = None,
+        url_convert: Callable[..., NewsletterDocument] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.settings = settings
@@ -516,6 +615,9 @@ class InboundEmailService:
         # Injected the same way the provider's transport is, so tests never resolve a
         # hostname or open a socket. None means the real SSRF-guarded fetcher.
         self.image_fetch = image_fetch
+        # URL conversion performs a remote fetch and is injected as one boundary so
+        # orchestration tests can exercise real publishing and storage without networking.
+        self.url_convert = url_convert
         # Monotonic, for the image time budget; injectable so a test can spend it.
         self._clock = clock
         # Read through the attribute rather than closing over the value, so the service's
@@ -524,7 +626,7 @@ class InboundEmailService:
             {REJECTION_REPLY_BUCKET: Policy(limit=REJECTION_REPLY_LIMIT, window_seconds=REJECTION_REPLY_WINDOW)},
             clock=lambda: self._clock(),
         )
-        self._newsletter_lock = threading.Lock()
+        self._article_lock = threading.Lock()
 
     def handle(self, raw_body: bytes, headers: Mapping[str, str]) -> InboundResult:
         if (
@@ -596,16 +698,23 @@ class InboundEmailService:
         attachments = self.provider.list_attachments(email_id)
         candidates = [attachment for attachment in attachments if _is_epub_candidate(attachment)]
 
-        # The product's central rule: an email carrying an EPUB is a book, an email
-        # without one is an article. Nothing else about the message decides this.
-        if not candidates:
+        # EPUB wins. Without one, an exact subject URL is Saved; everything else stays a
+        # newsletter. The body never activates URL mode.
+        subject_url = exact_subject_url(data.get("subject"))
+        if candidates:
+            result = self._import_books(scope, event_id, email_id, candidates)
+        elif subject_url is not None:
+            result = self.import_url_article(scope, email_id, subject_url)
+            self._record(
+                event_id,
+                f"url;imported={result.imported};duplicates={result.duplicates};rejected={result.rejected}",
+            )
+        else:
             result = self.import_newsletter(scope, email_id, attachments=attachments)
             self._record(
                 event_id,
                 f"newsletter;imported={result.imported};duplicates={result.duplicates};rejected={result.rejected}",
             )
-        else:
-            result = self._import_books(scope, event_id, email_id, candidates)
         self._reply_to_rejection(tenant, result, subject=data.get("subject"))
         return result
 
@@ -632,6 +741,14 @@ class InboundEmailService:
         subject_text = subject.strip() if isinstance(subject, str) else ""
         subject_text = " ".join(subject_text.split())[:200] or "your email"
         reasons = list(result.reasons) or [result.message]
+        actions = _rejection_actions(result)
+        guidance_text = ""
+        guidance_html = ""
+        if actions:
+            guidance_text = "\nTry this:\n" + "".join(f"- {action}\n" for action in actions)
+            guidance_html = "<p><strong>Try this:</strong></p><ul>" + "".join(
+                f"<li>{html_module.escape(action)}</li>" for action in actions
+            ) + "</ul>"
         filed = ""
         if result.imported or result.duplicates:
             count = result.imported + result.duplicates
@@ -640,6 +757,7 @@ class InboundEmailService:
         text = (
             f"Steepd could not file \"{subject_text}\".\n\n"
             + "".join(f"- {reason}\n" for reason in reasons)
+            + guidance_text
             + filed
             + "\nNothing has been charged against your storage for it. If this looks wrong, reply to this "
             "email and a person will look.\n"
@@ -649,6 +767,7 @@ class InboundEmailService:
             f"<p>Steepd could not file <strong>{html_module.escape(subject_text)}</strong>.</p><ul>"
             + "".join(f"<li>{html_module.escape(reason)}</li>" for reason in reasons)
             + "</ul>"
+            + guidance_html
             + (f"<p>{html_module.escape(filed.strip())}</p>" if filed else "")
             + "<p>Nothing has been charged against your storage for it. If this looks wrong, reply to "
             "this email and a person will look.</p></body></html>"
@@ -756,6 +875,7 @@ class InboundEmailService:
         duplicates = 0
         rejected = 0
         reasons: list[str] = []
+        rejection_categories: list[RejectionCategory] = []
         for attachment in candidates:
             try:
                 with self.provider.download_chunks(attachment) as chunks:
@@ -768,6 +888,7 @@ class InboundEmailService:
             except EpubImportError as exc:
                 rejected += 1
                 reasons.append(f"{attachment.filename[:120]}: {exc}")
+                rejection_categories.append(_storage_rejection_category(exc))
                 LOGGER.warning("Rejected inbound EPUB attachment_id=%s reason=%s", attachment.id, str(exc))
 
         message = f"Imported {imported} EPUB{'s' if imported != 1 else ''} from inbound email."
@@ -782,6 +903,8 @@ class InboundEmailService:
             tenant_id=scope.tenant_id,
             kind="book",
             reasons=tuple(reasons),
+            input_mode="epub",
+            rejection_category=_highest_rejection_category(rejection_categories),
         )
 
     def import_newsletter(
@@ -797,6 +920,18 @@ class InboundEmailService:
             raise InvalidWebhookEvent("Inbound email ID is invalid")
         try:
             return self._import_newsletter(scope, email_id, attachments)
+        except NewsletterSizeError as exc:
+            LOGGER.warning("Rejected inbound newsletter email_id=%s reason=%s", email_id, str(exc))
+            return InboundResult(
+                "ok",
+                "Newsletter could not be converted.",
+                rejected=1,
+                tenant_id=scope.tenant_id,
+                kind="article",
+                reasons=(str(exc),),
+                input_mode="newsletter",
+                rejection_category="size",
+            )
         except NewsletterConversionError as exc:
             LOGGER.warning("Rejected inbound newsletter email_id=%s reason=%s", email_id, str(exc))
             return InboundResult(
@@ -806,6 +941,8 @@ class InboundEmailService:
                 tenant_id=scope.tenant_id,
                 kind="article",
                 reasons=(str(exc),),
+                input_mode="newsletter",
+                rejection_category="content",
             )
         except EpubImportError as exc:
             # Storage refused the converted article: the quota is the realistic case. It is
@@ -819,6 +956,8 @@ class InboundEmailService:
                 tenant_id=scope.tenant_id,
                 kind="article",
                 reasons=(str(exc),),
+                input_mode="newsletter",
+                rejection_category=_storage_rejection_category(exc),
             )
 
     def _import_newsletter(
@@ -862,7 +1001,7 @@ class InboundEmailService:
         # Every remote image was fetched above, before this line, and must stay there: the
         # lock serialises deliveries across all tenants, so a slow
         # publisher CDN held inside it would stall every other tenant's mail.
-        with self._newsletter_lock:
+        with self._article_lock:
             if self.database.newsletter_delivery_exists(
                 scope,
                 NEWSLETTER_PROVIDER_NAME,
@@ -876,6 +1015,7 @@ class InboundEmailService:
                     duplicates=1,
                     tenant_id=scope.tenant_id,
                     kind="article",
+                    input_mode="newsletter",
                 )
 
             cid_resources = self._newsletter_resources(
@@ -920,6 +1060,88 @@ class InboundEmailService:
             imported=1,
             tenant_id=scope.tenant_id,
             kind="article",
+            input_mode="newsletter",
+        )
+
+    def import_url_article(self, scope: TenantScope, email_id: str, url: str) -> InboundResult:
+        if self.provider is None or not self.settings.resend_api_key or not self.settings.inbox_domain:
+            raise InboundEmailDisabled("Inbound email is not fully configured")
+        if not email_id or len(email_id) > 200:
+            raise InvalidWebhookEvent("Inbound email ID is invalid")
+
+        budget = _RemoteImageBudget(
+            remaining_bytes=self.settings.newsletter_max_total_image_bytes,
+            remaining_images=MAX_REMOTE_IMAGES_PER_NEWSLETTER,
+            deadline=self._clock() + REMOTE_IMAGE_TIME_BUDGET_SECONDS,
+        )
+        convert = self.url_convert if self.url_convert is not None else convert_url_article
+        try:
+            document = convert(
+                url,
+                public_base_url=self.settings.public_base_url,
+                max_body_bytes=self.settings.newsletter_max_body_bytes,
+                created_at=datetime.now(UTC).isoformat(),
+                fetch_remote_image=self._remote_image_fetcher(budget),
+            )
+        except UrlArticleTooLarge as exc:
+            LOGGER.warning("Rejected inbound URL article url=%s reason=%s", _loggable_url(url), str(exc))
+            return InboundResult(
+                "ok",
+                "Webpage could not be converted.",
+                rejected=1,
+                tenant_id=scope.tenant_id,
+                kind="article",
+                reasons=(str(exc),),
+                input_mode="url",
+                rejection_category="size",
+            )
+        except UrlArticleError as exc:
+            LOGGER.warning("Rejected inbound URL article url=%s reason=%s", _loggable_url(url), str(exc))
+            return InboundResult(
+                "ok",
+                "Webpage could not be converted.",
+                rejected=1,
+                tenant_id=scope.tenant_id,
+                kind="article",
+                reasons=(str(exc),),
+                input_mode="url",
+                rejection_category="content",
+            )
+
+        try:
+            with self._article_lock:
+                title = _next_saved_title(
+                    document.title,
+                    self.database.list_item_titles(scope, source="url"),
+                )
+                document = replace(document, title=title)
+                LocalNewsletterPublisher(self.storage, scope).publish(
+                    document,
+                    document.remote_resources,
+                    (),
+                    source="url",
+                )
+        except EpubImportError as exc:
+            LOGGER.warning("Could not store inbound URL article url=%s reason=%s", _loggable_url(url), str(exc))
+            return InboundResult(
+                "ok",
+                "Webpage could not be stored.",
+                rejected=1,
+                tenant_id=scope.tenant_id,
+                kind="article",
+                reasons=(str(exc),),
+                input_mode="url",
+                rejection_category=_storage_rejection_category(exc),
+            )
+
+        LOGGER.info("Imported URL article into the library url=%s", _loggable_url(url))
+        return InboundResult(
+            "ok",
+            "Imported 1 webpage into your library.",
+            imported=1,
+            tenant_id=scope.tenant_id,
+            kind="article",
+            input_mode="url",
         )
 
     def _remote_image_fetcher(self, budget: _RemoteImageBudget) -> RemoteImageFetcher:
@@ -985,7 +1207,7 @@ class InboundEmailService:
             if attachment is None:
                 raise NewsletterConversionError("Referenced inline image is missing")
             if attachment.size <= 0 or attachment.size > self.settings.newsletter_max_image_bytes:
-                raise NewsletterConversionError("Inline newsletter image exceeds the configured size limit")
+                raise NewsletterSizeError("Inline newsletter image exceeds the configured size limit")
             with self.provider.download_chunks(attachment) as chunks:
                 content_parts: list[bytes] = []
                 image_bytes = 0
@@ -993,9 +1215,9 @@ class InboundEmailService:
                     image_bytes += len(chunk)
                     total_bytes += len(chunk)
                     if image_bytes > self.settings.newsletter_max_image_bytes:
-                        raise NewsletterConversionError("Inline newsletter image exceeds the configured size limit")
+                        raise NewsletterSizeError("Inline newsletter image exceeds the configured size limit")
                     if total_bytes > self.settings.newsletter_max_total_image_bytes:
-                        raise NewsletterConversionError("Newsletter images exceed the configured total-size limit")
+                        raise NewsletterSizeError("Newsletter images exceed the configured total-size limit")
                     content_parts.append(chunk)
             content = b"".join(content_parts)
             if not content:

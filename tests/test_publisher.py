@@ -58,6 +58,20 @@ def test_publishing_files_an_article_item(publisher):
     assert item.title == "Weekly digest"
     assert item.author == "Weekly Writer"
     assert item.source_url == "https://example.com/weekly"
+    assert item.source == "newsletter"
+
+
+def test_publisher_can_file_a_url_article_as_saved(publisher):
+    """A hard-coded newsletter source would make every URL article disappear from Saved
+    and incorrectly appear in the Newsletters shelf."""
+    database, _, scope, pub = publisher
+
+    item_id = pub.publish(_document(), [], (), source="url")
+
+    item = database.get_item(scope, item_id)
+    assert item is not None
+    assert item.kind == "article"
+    assert item.source == "url"
 
 
 def test_published_article_is_a_readable_epub(publisher):

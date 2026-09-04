@@ -1,7 +1,7 @@
 # Steepd
 
-Email a newsletter or an EPUB to your private Steepd address and it appears on your
-e-reader, ready to read.
+Email a newsletter, a webpage link or an EPUB to your private Steepd address and it
+appears on your e-reader, ready to read.
 
 Every email you send in is turned into a clean EPUB and added to a personal OPDS
 catalogue. Point your e-reader at that catalogue once and new items just show up. It is
@@ -18,15 +18,16 @@ source for it, under the AGPL, so you can also run your own.
 - You sign up with an email address; there is no password. Sign-in is a link by email.
 - On first sign-in you choose your inbox address, which is also the username your reader
   signs in with. It cannot be changed afterwards.
-- Email an EPUB to your address and it is filed as a book. Email anything else, a
-  newsletter, an article, a forwarded message, and it is cleaned up and filed as an
-  article. Images are fetched once and stored inside the EPUB; tracking pixels and
-  tracking parameters are dropped.
+- Attach an EPUB and it is filed as a book. With no EPUB attached, put one webpage URL
+  alone in the subject to file its readable article in Saved. Anything else is treated as
+  a newsletter or forwarded article. Images are fetched once and stored inside the EPUB;
+  tracking pixels and tracking parameters are dropped.
 - Both show up on your reader through the same feed. Your reader signs in with the
   username and a device passphrase generated from the account page.
 - Anyone who has your address can send to it by default. The account page can restrict
   that to listed senders.
-- If something you sent could not be filed, you get one email saying why.
+- If something you sent could not be filed, you get one email saying why and up to three
+  practical things to try.
 
 ## The hosted service
 
@@ -37,8 +38,8 @@ and no promise about uptime or data retention beyond what the terms page says.
 ## Running your own
 
 Steepd is one Python process with one SQLite file and one data directory. It is small
-enough to run on the smallest instance of any container host, and it has no external
-services beyond a mail provider.
+enough to run on the smallest instance of any container host, and it needs no supporting
+infrastructure service beyond a mail provider.
 
 What you need:
 
@@ -120,7 +121,7 @@ environment variables.
 - No JavaScript, no template engine, no ORM, no queue, no cache server. The pages are
   strings, the database is SQLite, background work is one thread.
 - No web upload. Email is the only way in, on purpose.
-- No RSS or URL saving yet.
+- No RSS, browser extension, paywall bypass, or site-specific extraction rules.
 
 ## Contributing
 

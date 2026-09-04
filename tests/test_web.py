@@ -903,8 +903,29 @@ def test_the_landing_page_makes_its_case_and_offers_the_real_sign_up(web):
     assert 'action="/signup"' in body
     assert "Create your reader address" in body
     assert "Free while Steepd is in beta" in body
+    assert "one webpage URL alone in the email subject" in body
     assert 'href="/privacy"' in body
     assert 'href="/terms"' in body
+
+
+def test_the_landing_diagram_shows_all_three_email_inputs_and_saved(web):
+    client, _ = web
+    soup = BeautifulSoup(client.get("/").text, "html.parser")
+    diagram = soup.find("div", class_="diagram")
+    assert diagram is not None
+    svg = diagram.find("svg")
+    assert svg is not None
+
+    spoken = svg.get("aria-label", "")
+    assert "forwarded newsletter" in spoken
+    assert "webpage URL in the email subject" in spoken
+    assert "attached EPUB" in spoken
+    visible = " ".join(svg.stripped_strings)
+    assert "Newsletter" in visible
+    assert "Webpage" in visible
+    assert "link in subject" in visible
+    assert "EPUB" in visible
+    assert "Saved" in visible
 
 
 def test_the_landing_pricing_quotes_the_plans_module_rather_than_a_number(web):
@@ -1009,6 +1030,11 @@ def test_the_walkthrough_types_the_address_this_deployment_answers_on(web):
     assert f"you@{INBOX_DOMAIN}" in body
     assert f"your @{INBOX_DOMAIN} address" in body
     assert "steepd.app" not in body, "the walkthrough quoted a domain the settings did not give it"
+    assert "start a blank email and put only its URL in Subject" in body
+    assert (
+        "For a link, start a blank email, put one webpage URL alone in the subject, "
+        f"and send it to your @{INBOX_DOMAIN} address. It appears in Saved."
+    ) in body
 
 
 def test_the_walkthrough_names_no_address_when_no_inbox_domain_is_configured(tmp_path):
@@ -1031,7 +1057,8 @@ def test_the_walkthrough_is_one_line_of_markdown_not_a_transcript(web):
     client, _ = web
     body = client.get("/", headers=MARKDOWN).text
 
-    assert f"See how it works: forward any email to your @{INBOX_DOMAIN} address" in body
+    assert f"See how it works: forward a newsletter to your @{INBOX_DOMAIN} address" in body
+    assert "put one webpage URL alone in Subject" in body
     assert "EPUB attachments are filed as books" in body
     for staging in ("The Weekly Dispatch", "Issue #42", "Show me how it works", "Start over", "Simple, right?"):
         assert staging not in body, f"the walkthrough's internals leaked into the markdown: {staging}"
@@ -1092,6 +1119,8 @@ def test_the_privacy_page_states_what_the_service_actually_does(web):
     assert response.status_code == 200
     assert "sign-in links" in response.text
     assert "fetched once" in response.text
+    assert "public webpage html" in response.text.lower()
+    assert "webpage images" in response.text.lower()
     assert "Tracking pixels are dropped" in response.text
     assert "no analytics" in response.text.lower()
     assert "keep you signed in" in response.text
@@ -1103,6 +1132,13 @@ def test_the_privacy_page_states_what_the_service_actually_does(web):
     # that nobody else is ever sent mail meant for you.
     assert "your inbox address is held back so nobody else can ever be sent your mail" in response.text
     assert "your stored files and your inbox address" not in response.text
+
+
+def test_the_account_names_links_as_an_inbox_option(web):
+    client, sent = web
+    _sign_up(client, sent)
+
+    assert "Send books, newsletters, and links here" in client.get("/account").text
 
 
 def test_the_privacy_retention_number_comes_from_the_plans_module(web):

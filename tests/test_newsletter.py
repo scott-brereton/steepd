@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup
 from steepd.newsletter import (
     NewsletterConversionError,
     NewsletterEmail,
+    clean_article_html,
     convert_newsletter,
 )
 
@@ -31,6 +32,29 @@ def email_with(
         created_at="2026-08-25T20:00:00Z",
         message_id="<newsletter-1@example.com>",
     )
+
+
+def test_direct_article_cleaning_applies_the_newsletter_safety_and_link_rules() -> None:
+    """A URL extractor returns untrusted HTML. Skipping the shared cleaner would leave
+    executable markup or publisher tracking in the EPUB."""
+    document = clean_article_html(
+        '<article><script>bad()</script><p>This useful article paragraph contains enough '
+        'readable prose to pass the existing quality gate and remain in the saved file.</p>'
+        '<a href="/read?utm_source=mail&amp;keep=yes">Read</a></article>',
+        title="A story",
+        author="Ada Writer",
+        source_url="https://publisher.example/story",
+        created_at="2026-09-04T12:00:00Z",
+        document_key="url-fixture",
+        public_base_url="https://steepd.app",
+    )
+
+    assert "<script" not in document.html
+    assert "bad()" not in document.html
+    assert 'href="https://publisher.example/read?keep=yes"' in document.html
+    assert document.title == "A story"
+    assert document.author == "Ada Writer"
+    assert document.source_url == "https://publisher.example/story"
 
 
 def test_html_conversion_removes_forwarding_chrome_and_normalizes_email_layout() -> None:

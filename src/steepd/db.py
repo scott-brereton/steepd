@@ -738,6 +738,16 @@ class Database:
             rows = connection.execute(sql, [*params, limit, offset]).fetchall()
         return [self._item(row) for row in rows]
 
+    def list_item_titles(self, scope: TenantScope, *, source: str) -> list[str]:
+        """Return current titles for one tenant and source, for Saved-name selection."""
+        with self._session() as connection:
+            rows = connection.execute(
+                "SELECT title FROM items WHERE tenant_id = ? AND source = ? "
+                "ORDER BY created_at ASC, id ASC",
+                (scope.tenant_id, source),
+            ).fetchall()
+        return [str(row["title"]) for row in rows]
+
     def count_items(
         self,
         scope: TenantScope,

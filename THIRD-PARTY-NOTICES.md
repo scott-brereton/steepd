@@ -8,3 +8,9 @@ https://www.eff.org/dice and licensed under the Creative Commons Attribution 3.0
 States licence (https://creativecommons.org/licenses/by/3.0/us/). The vendored copy
 strips the leading dice indices and omits the four hyphenated entries; see
 `src/steepd/words.py` for the exact diff.
+
+## Trafilatura
+
+Steepd uses Trafilatura 2.2.0 to extract the readable article and metadata from webpage
+HTML. Trafilatura is published at https://github.com/adbar/trafilatura and licensed under
+the Apache License 2.0 (https://www.apache.org/licenses/LICENSE-2.0).

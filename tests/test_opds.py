@@ -129,13 +129,10 @@ def two_tenants_with_items(tmp_path):
 
 
 def test_root_catalog_lists_the_shipping_sections(database_with_items):
-    """Saved is deliberately absent: /opds/saved filters source="url", which nothing writes
-    until Plan 2, so advertising it would put a permanently empty shelf on a device."""
     database, scope = database_with_items
     xml = build_root_catalog(database, scope, BASE_URL).decode()
-    for title in ("Recent", "Newsletters", "Books"):
+    for title in ("Recent", "Saved", "Newsletters", "Books"):
         assert f"<title>{title}</title>" in xml
-    assert "<title>Saved</title>" not in xml
 
 
 def test_catalog_only_contains_the_scoped_tenants_items(two_tenants_with_items):
@@ -161,6 +158,7 @@ def test_root_catalog_matches_crosspoint_navigation_rules(database_with_items):
     entries = crosspoint_parse(xml)
     assert [(item.kind, item.title) for item in entries] == [
         ("navigation", "Recent"),
+        ("navigation", "Saved"),
         ("navigation", "Newsletters"),
         ("navigation", "Books"),
     ]

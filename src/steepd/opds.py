@@ -144,15 +144,20 @@ def build_root_catalog(database: Database, scope: TenantScope, base_url: str) ->
     )
     _navigation_entry(
         root,
+        entry_id="urn:steepd:saved",
+        title="Saved",
+        updated=updated,
+        href=_absolute(base_url, "/opds/saved"),
+        description="Webpages saved from a link in an email subject",
+    )
+    _navigation_entry(
+        root,
         entry_id="urn:steepd:newsletters",
         title="Newsletters",
         updated=updated,
         href=_absolute(base_url, "/opds/newsletters"),
         description="Newsletters delivered to your inbox",
     )
-    # No "Saved" entry: it filters source="url", and URL saving is Plan 2, so the shelf
-    # would be permanently empty on a device. /opds/saved still exists and works -- the
-    # entry comes back here when Plan 2 lands.
     _navigation_entry(
         root,
         entry_id="urn:steepd:books",

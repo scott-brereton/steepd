@@ -17,6 +17,7 @@ from svix.webhooks import Webhook
 
 from steepd.config import Settings
 from steepd.db import Database
+from steepd.epub import ServiceStorageFull
 from steepd.imagefetch import FetchedImage, ImageFetchError
 from steepd.inbound import (
     REJECTION_REPLY_WINDOW,
@@ -24,15 +25,18 @@ from steepd.inbound import (
     RESEND_ATTACHMENT_HOSTS,
     InboundEmailDisabled,
     InboundEmailService,
+    InboundResult,
     InvalidWebhookEvent,
     InvalidWebhookSignature,
     ProviderRequestError,
     ResendInboundProvider,
     resolve_inbox_local,
 )
+from steepd.newsletter import NewsletterConversionStats, NewsletterDocument
 from steepd.outbound import MAX_SUBJECT_LENGTH
 from steepd.storage import ItemStorage
 from steepd.tenancy import TenantScope
+from steepd.urlarticle import UrlArticleError
 
 WEBHOOK_SECRET = "whsec_" + base64.b64encode(b"steepd-tenant-test-webhook-secre").decode()
 API_KEY = "re_test_api_key"
@@ -265,7 +269,7 @@ class FakeInboundProvider(ResendInboundProvider):
         return httpx.Response(200, content=content, headers={"Content-Length": str(len(content))})
 
 
-def _build_env(tmp_path, inboxes: Sequence[str], *, image_fetch=None, **settings_overrides):
+def _build_env(tmp_path, inboxes: Sequence[str], *, image_fetch=None, url_convert=None, **settings_overrides):
     settings = configured(Settings(data_dir=tmp_path, public_base_url="http://localhost:8000"))
     if settings_overrides:
         settings = replace(settings, **settings_overrides)
@@ -278,7 +282,14 @@ def _build_env(tmp_path, inboxes: Sequence[str], *, image_fetch=None, **settings
         for local in inboxes
     ]
     provider = FakeInboundProvider()
-    service = InboundEmailService(settings, database, storage, provider, image_fetch=image_fetch)
+    service = InboundEmailService(
+        settings,
+        database,
+        storage,
+        provider,
+        image_fetch=image_fetch,
+        url_convert=url_convert,
+    )
     return settings, database, storage, service, tenants, provider
 
 
@@ -357,6 +368,51 @@ class StubImageFetch:
         return FetchedImage(content_type=self.content_type, content=self.content)
 
 
+class StubUrlConvert:
+    """Returns a real article document while keeping inbound tests off the network."""
+
+    def __init__(
+        self,
+        *,
+        title: str = "A useful story",
+        final_url: str = "https://publisher.example/final/story",
+        error: Exception | None = None,
+    ) -> None:
+        self.title = title
+        self.final_url = final_url
+        self.error = error
+        self.urls: list[str] = []
+
+    def __call__(
+        self,
+        url: str,
+        *,
+        public_base_url: str,
+        max_body_bytes: int,
+        created_at: str,
+        fetch_remote_image,
+    ) -> NewsletterDocument:
+        self.urls.append(url)
+        if self.error is not None:
+            raise self.error
+        assert public_base_url == "http://localhost:8000"
+        assert max_body_bytes > 0
+        assert callable(fetch_remote_image)
+        return NewsletterDocument(
+            title=self.title,
+            html=(
+                "<html><body><article><p>This extracted webpage has enough readable prose "
+                "to become a useful offline article in the reader library.</p></article></body></html>"
+            ),
+            source_url=self.final_url,
+            author="Ada Writer",
+            created_at=created_at,
+            content_sha256="u" * 64,
+            inline_images=(),
+            stats=NewsletterConversionStats(100, 100, 1.0, 0, 0, 0, 0, 0),
+        )
+
+
 # -- the address contract -------------------------------------------------
 
 
@@ -410,6 +466,83 @@ def test_email_without_attachment_becomes_an_article(inbound_env):
 
     assert result.kind == "article"
     assert database.count_items(scope, kind="article") == 1
+
+
+def test_exact_url_subject_becomes_a_saved_article_and_ignores_the_body(tmp_path):
+    converter = StubUrlConvert()
+    _, database, _, service, tenants, provider = _build_env(tmp_path, ["a.1"], url_convert=converter)
+    scope = TenantScope(tenants[0].id)
+    provider.queue_email(
+        to="a.1@read.steepd.app",
+        subject="  https://short.example/story  ",
+        html="<p>This body must not decide what URL mode imports.</p>",
+    )
+
+    result = service.handle(*provider.signed_event())
+
+    assert result.imported == 1
+    assert result.input_mode == "url"
+    item = database.list_items(scope)[0]
+    assert item.kind == "article"
+    assert item.source == "url"
+    assert item.source_url == "https://publisher.example/final/story"
+    assert item.title == "A useful story"
+
+
+def test_epub_attachment_wins_over_an_exact_url_subject(tmp_path):
+    converter = StubUrlConvert()
+    _, database, _, service, tenants, provider = _build_env(tmp_path, ["a.1"], url_convert=converter)
+    scope = TenantScope(tenants[0].id)
+    provider.queue_email(
+        to="a.1@read.steepd.app",
+        subject="https://short.example/story",
+        attachments=["novel.epub"],
+    )
+
+    result = service.handle(*provider.signed_event())
+
+    assert result.kind == "book"
+    assert result.input_mode == "epub"
+    assert database.count_items(scope, kind="book") == 1
+    assert database.count_items(scope, source="url") == 0
+
+
+def test_a_url_only_in_the_body_remains_a_newsletter(tmp_path):
+    converter = StubUrlConvert()
+    _, database, _, service, tenants, provider = _build_env(tmp_path, ["a.1"], url_convert=converter)
+    scope = TenantScope(tenants[0].id)
+    provider.queue_email(
+        to="a.1@read.steepd.app",
+        subject="Save this article",
+        html=f"{ARTICLE_BODY}<p>https://publisher.example/story</p>",
+    )
+
+    result = service.handle(*provider.signed_event())
+
+    assert result.input_mode == "newsletter"
+    assert database.count_items(scope, source="newsletter") == 1
+    assert database.count_items(scope, source="url") == 0
+
+
+@pytest.mark.parametrize(
+    "subject",
+    [
+        "Read: https://publisher.example/story",
+        "https://publisher.example/story notes",
+        "https://one.example https://two.example",
+    ],
+)
+def test_non_exact_url_subjects_remain_newsletters(tmp_path, subject):
+    converter = StubUrlConvert()
+    _, database, _, service, tenants, provider = _build_env(tmp_path, ["a.1"], url_convert=converter)
+    scope = TenantScope(tenants[0].id)
+    provider.queue_email(to="a.1@read.steepd.app", subject=subject, html=ARTICLE_BODY)
+
+    result = service.handle(*provider.signed_event())
+
+    assert result.input_mode == "newsletter"
+    assert database.count_items(scope, source="newsletter") == 1
+    assert database.count_items(scope, source="url") == 0
 
 
 def test_email_to_unknown_inbox_is_discarded(inbound_env):
@@ -648,10 +781,16 @@ def test_a_failed_delivery_releases_its_claim_so_the_retry_is_processed(inbound_
 # -- telling the reader ------------------------------------------------------
 
 
-def _replying_env(tmp_path, monkeypatch, **overrides):
+def _replying_env(tmp_path, monkeypatch, *, url_convert=None, **overrides):
     sent: list[dict] = []
     monkeypatch.setattr("steepd.inbound.send_email", lambda settings, **message: sent.append(message))
-    built = _build_env(tmp_path, ["a.1"], mail_from_address="Steepd <noreply@steepd.example>", **overrides)
+    built = _build_env(
+        tmp_path,
+        ["a.1"],
+        mail_from_address="Steepd <noreply@steepd.example>",
+        url_convert=url_convert,
+        **overrides,
+    )
     return built, sent
 
 
@@ -671,6 +810,8 @@ def test_a_rejected_attachment_is_explained_to_the_account_holder(tmp_path, monk
     result = service.handle(*provider.signed_event())
 
     assert result.imported == 1 and result.rejected == 1
+    assert result.input_mode == "epub"
+    assert result.rejection_category == "content"
     assert len(sent) == 1
     reply = sent[0]
     assert reply["to"] == tenants[0].email
@@ -678,6 +819,27 @@ def test_a_rejected_attachment_is_explained_to_the_account_holder(tmp_path, monk
     assert "broken.epub" in reply["text"]
     assert "The other 1 item from the same email is in your library." in reply["text"]
     assert "broken.epub" in reply["html"]
+    assert "Try this:" in reply["text"]
+    epub_actions = (
+        "Attach the actual .epub file, not a download link, cloud shortcut, ZIP, or renamed file.",
+        "Open the EPUB in an e-reader app to confirm the file works, then send it again.",
+    )
+    assert all(action in reply["text"] and action in reply["html"] for action in epub_actions)
+    guidance = reply["text"].split("Try this:\n", 1)[1].split("\nThe other", 1)[0]
+    assert sum(line.startswith("- ") for line in guidance.splitlines()) <= 3
+
+
+def test_an_oversize_epub_gets_smaller_file_guidance(tmp_path, monkeypatch):
+    (_, _, _, service, _, provider), sent = _replying_env(tmp_path, monkeypatch)
+    provider.max_download_bytes = 1
+    provider.queue_email(to="a.1@read.steepd.app", subject="Large book", attachments=["large.epub"])
+
+    result = service.handle(*provider.signed_event())
+
+    assert result.rejected == 1
+    assert result.input_mode == "epub"
+    assert result.rejection_category == "size"
+    assert "Send a smaller EPUB file." in sent[0]["text"]
 
 
 def test_nothing_is_sent_when_everything_was_filed(tmp_path, monkeypatch):
@@ -696,8 +858,60 @@ def test_an_unconvertible_newsletter_is_explained(tmp_path, monkeypatch):
     result = service.handle(*provider.signed_event())
 
     assert result.rejected == 1
+    assert result.input_mode == "newsletter"
+    assert result.rejection_category == "content"
     assert sent[0]["to"] == tenants[0].email
     assert "readable content" in sent[0]["text"]
+    assert "put the full URL alone in the Subject, not the body" in sent[0]["text"]
+
+
+def test_an_unextractable_url_gets_subject_and_forwarding_fixes(tmp_path, monkeypatch):
+    converter = StubUrlConvert(error=UrlArticleError("The webpage did not contain a readable article."))
+    (_, database, _, service, tenants, provider), sent = _replying_env(
+        tmp_path,
+        monkeypatch,
+        url_convert=converter,
+    )
+    scope = TenantScope(tenants[0].id)
+    provider.queue_email(to="a.1@read.steepd.app", subject="https://publisher.example/story")
+
+    result = service.handle(*provider.signed_event())
+
+    assert result.rejected == 1
+    assert result.input_mode == "url"
+    assert result.rejection_category == "content"
+    assert database.count_items(scope) == 0
+    reply = sent[0]
+    assert "The webpage did not contain a readable article." in reply["text"]
+    url_actions = (
+        "Put one complete http:// or https:// URL alone in the Subject, not the email body.",
+        "Use a public article that does not require sign-in, a saved browser session, "
+        "JavaScript-only loading, or paywall access.",
+        "If the page still cannot be extracted, forward or paste its readable content into an email instead.",
+    )
+    assert all(action in reply["text"] and action in reply["html"] for action in url_actions)
+    guidance = reply["text"].split("Try this:\n", 1)[1].split("\n\nNothing", 1)[0]
+    assert sum(line.startswith("- ") for line in guidance.splitlines()) == 3
+
+
+def test_a_rejected_url_log_omits_credentials_query_and_fragment(tmp_path, caplog):
+    converter = StubUrlConvert(error=UrlArticleError("The webpage could not be fetched safely."))
+    _, _, _, service, _, provider = _build_env(tmp_path, ["a.1"], url_convert=converter)
+    provider.queue_email(
+        to="a.1@read.steepd.app",
+        subject="https://reader:secret@publisher.example/story?token=private#section",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="steepd.inbound"):
+        service.handle(*provider.signed_event())
+
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "https://publisher.example/story" in logged
+    assert "reader" not in logged
+    assert "secret" not in logged
+    assert "token" not in logged
+    assert "private" not in logged
+    assert "section" not in logged
 
 
 def test_rejection_replies_are_capped_per_tenant_per_hour(tmp_path, monkeypatch):
@@ -738,9 +952,50 @@ def test_a_full_account_refuses_a_newsletter_as_a_rejection_not_an_error(tmp_pat
     result = service.handle(body, headers)
 
     assert result.rejected == 1
+    assert result.rejection_category == "storage"
     assert database.count_items(scope) == 0
     assert "storage limit" in sent[0]["text"]
+    assert "Delete an item from your library, then send this again." in sent[0]["text"]
+    assert "forward the complete original" not in sent[0]["text"].casefold()
     assert webhook_result(database, headers["svix-id"]).startswith("newsletter;")
+
+
+def test_service_capacity_rejection_says_to_retry_later(tmp_path, monkeypatch):
+    (_, _, _, service, _, provider), sent = _replying_env(tmp_path, monkeypatch)
+
+    def volume_full(scope, incoming_bytes):
+        raise ServiceStorageFull("Steepd storage is temporarily full; please try again later")
+
+    monkeypatch.setattr(service.storage, "_enforce_quota", volume_full)
+    provider.queue_email(to="a.1@read.steepd.app", subject="Fwd: Monday note", html=ARTICLE_BODY)
+
+    result = service.handle(*provider.signed_event())
+
+    assert result.rejected == 1
+    assert result.rejection_category == "service"
+    assert "Try sending it again later." in sent[0]["text"]
+    assert "Delete an item" not in sent[0]["text"]
+
+
+def test_rejection_guidance_uses_explicit_metadata_not_reason_words(tmp_path, monkeypatch):
+    """Reason prose changes. Treating a mention of storage as a category would silently
+    swap the recovery advice even though the caller explicitly marked a content problem."""
+    (_, _, _, service, tenants, _), sent = _replying_env(tmp_path, monkeypatch)
+    result = InboundResult(
+        "ok",
+        "Newsletter could not be converted.",
+        rejected=1,
+        tenant_id=tenants[0].id,
+        kind="article",
+        reasons=("This arbitrary content reason happens to mention a storage limit.",),
+        input_mode="newsletter",
+        rejection_category="content",
+    )
+
+    service._reply_to_rejection(tenants[0], result, subject="Fwd: Broken")
+
+    assert "put the full URL alone in the Subject, not the body" in sent[0]["text"]
+    assert "Delete an item from your library" not in sent[0]["text"]
 
 
 def test_no_reply_without_an_outbound_sender_configured(tmp_path, monkeypatch):
@@ -802,6 +1057,88 @@ def test_remote_images_stop_when_the_delivery_time_budget_is_spent(tmp_path):
 
 
 # -- articles -------------------------------------------------------------
+
+
+def test_repeated_url_emails_receive_the_first_available_title_suffix(tmp_path):
+    converter = StubUrlConvert(title="The long view")
+    _, database, _, service, tenants, provider = _build_env(tmp_path, ["a.1"], url_convert=converter)
+    scope = TenantScope(tenants[0].id)
+
+    for event_number in range(1, 4):
+        provider.queue_email(
+            to="a.1@read.steepd.app",
+            subject="https://short.example/story",
+            svix_id=f"url-save-{event_number}",
+        )
+        assert service.handle(*provider.signed_event()).imported == 1
+
+    assert {item.title for item in database.list_items(scope, source="url")} == {
+        "The long view",
+        "The long view (2)",
+        "The long view (3)",
+    }
+
+
+def test_deleting_a_repeated_url_releases_its_numeric_suffix(tmp_path):
+    converter = StubUrlConvert(title="The long view")
+    _, database, storage, service, tenants, provider = _build_env(tmp_path, ["a.1"], url_convert=converter)
+    scope = TenantScope(tenants[0].id)
+    for event_number in range(1, 3):
+        provider.queue_email(
+            to="a.1@read.steepd.app",
+            subject="https://short.example/story",
+            svix_id=f"url-delete-{event_number}",
+        )
+        service.handle(*provider.signed_event())
+    repeated = next(item for item in database.list_items(scope, source="url") if item.title.endswith("(2)"))
+    assert storage.delete(scope, repeated.id)
+
+    provider.queue_email(
+        to="a.1@read.steepd.app",
+        subject="https://short.example/story",
+        svix_id="url-delete-3",
+    )
+    service.handle(*provider.signed_event())
+
+    assert {item.title for item in database.list_items(scope, source="url")} == {
+        "The long view",
+        "The long view (2)",
+    }
+
+
+def test_saved_title_numbering_is_tenant_scoped(tmp_path):
+    converter = StubUrlConvert(title="The long view")
+    _, database, _, service, tenants, provider = _build_env(
+        tmp_path,
+        ["a.1", "b.2"],
+        url_convert=converter,
+    )
+    alice_scope = TenantScope(tenants[0].id)
+    bob_scope = TenantScope(tenants[1].id)
+
+    provider.queue_email(to="a.1@read.steepd.app", subject="https://short.example/story", svix_id="url-alice")
+    service.handle(*provider.signed_event())
+    provider.queue_email(to="b.2@read.steepd.app", subject="https://short.example/story", svix_id="url-bob")
+    service.handle(*provider.signed_event())
+
+    assert database.list_items(alice_scope, source="url")[0].title == "The long view"
+    assert database.list_items(bob_scope, source="url")[0].title == "The long view"
+
+
+def test_replayed_url_webhook_does_not_create_another_saved_item(tmp_path):
+    converter = StubUrlConvert(title="The long view")
+    _, database, _, service, tenants, provider = _build_env(tmp_path, ["a.1"], url_convert=converter)
+    scope = TenantScope(tenants[0].id)
+    provider.queue_email(
+        to="a.1@read.steepd.app",
+        subject="https://short.example/story",
+        svix_id="url-replay",
+    )
+    event = provider.signed_event()
+
+    assert service.handle(*event).imported == 1
+    assert service.handle(*event).status == "duplicate_event"
+    assert database.count_items(scope, source="url") == 1
 
 
 def test_repeat_forward_of_the_same_newsletter_is_deduplicated(inbound_env):
