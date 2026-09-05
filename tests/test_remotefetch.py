@@ -122,3 +122,32 @@ def test_remote_fetch_raises_a_typed_size_error_for_streamed_overflow():
             transport=transport,
             resolve_host=resolver,
         )
+
+
+def test_remote_fetch_sends_an_internationalized_hostname_in_idna_form():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, headers={"content-type": "text/html"}, content=b"<html/>")
+
+    fetched = fetch_remote(
+        "https://bücher.example/story",
+        max_bytes=1024,
+        transport=httpx.MockTransport(handler),
+        resolve_host=resolver,
+    )
+
+    assert requests[0].headers["host"] == "xn--bcher-kva.example"
+    assert requests[0].extensions["sni_hostname"] == "xn--bcher-kva.example"
+    assert fetched.final_url == "https://xn--bcher-kva.example/story"
+
+
+def test_remote_fetch_rejects_a_hostname_that_cannot_be_idna_encoded():
+    with pytest.raises(RemoteFetchError, match="hostname"):
+        fetch_remote(
+            "https://a..example/story",
+            max_bytes=1024,
+            transport=httpx.MockTransport(lambda request: httpx.Response(200)),
+            resolve_host=resolver,
+        )

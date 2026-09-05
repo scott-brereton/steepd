@@ -127,6 +127,14 @@ def _prepare_target(url: str, resolver: Callable[[str], Sequence[str]]) -> _Targ
     except ValueError:
         literal = None
 
+    if literal is None:
+        # The Host header and SNI are ASCII-only, so an internationalized name has to go
+        # over the wire in its IDNA form; a name that has none is not fetchable at all.
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError as exc:
+            raise RemoteFetchError("Remote URL hostname could not be encoded") from exc
+
     if literal is not None:
         addresses = [str(_validate_address(host))]
     else:
