@@ -12,20 +12,20 @@ handing it the paid allowance would make the cheapest way past a quota a bad wri
 from __future__ import annotations
 
 from datetime import timedelta
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from steepd.config import Settings
 
 FREE_PLAN = "free"
 PAID_PLAN = "paid"
 KNOWN_PLANS = (FREE_PLAN, PAID_PLAN)
 
-FREE_QUOTA_BYTES = 100 * 1024 * 1024
-PAID_QUOTA_BYTES = 5 * 1024 * 1024 * 1024
-FREE_RETENTION = timedelta(days=7)
+
+def quota_bytes(plan: str, *, settings: Settings) -> int:
+    return settings.paid_quota_bytes if plan == PAID_PLAN else settings.free_quota_bytes
 
 
-def quota_bytes(plan: str) -> int:
-    return PAID_QUOTA_BYTES if plan == PAID_PLAN else FREE_QUOTA_BYTES
-
-
-def retention_for(plan: str) -> timedelta | None:
+def retention_for(plan: str, *, settings: Settings) -> timedelta | None:
     """How long an item of this plan's tenant is kept, or None for kept-until-deleted."""
-    return None if plan == PAID_PLAN else FREE_RETENTION
+    return None if plan == PAID_PLAN else settings.free_retention

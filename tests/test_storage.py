@@ -1,6 +1,7 @@
 import io
 import zipfile
 from collections.abc import Callable, Iterator, Sequence
+from dataclasses import replace
 
 import pytest
 
@@ -9,14 +10,19 @@ from steepd.db import Database
 from steepd.epub import ServiceStorageFull, StorageQuotaExceeded, UnsafeEpub, UploadTooLarge
 from steepd.epubgen import build_epub
 from steepd.models import Item
-from steepd.plans import FREE_QUOTA_BYTES, PAID_PLAN, PAID_QUOTA_BYTES
+from steepd.plans import FREE_PLAN, PAID_PLAN
 from steepd.storage import ItemStorage
 from steepd.tenancy import TenantScope
 
+QUOTA_SETTINGS = [
+    pytest.param({}, id="default"),
+    pytest.param({"free_quota_bytes": 8192, "paid_quota_bytes": 16384}, id="custom"),
+]
+
 
 @pytest.fixture
-def storage(tmp_path):
-    settings = Settings(data_dir=tmp_path, public_base_url="http://localhost:8000")
+def storage(tmp_path, request):
+    settings = Settings(data_dir=tmp_path, public_base_url="http://localhost:8000", **getattr(request, "param", {}))
     database = Database(tmp_path / "steepd.sqlite3")
     database.initialize()
     store = ItemStorage(settings, database)
@@ -353,11 +359,15 @@ def _charge(database, scope, size_bytes, *, item_id="filler", sha="filler-sha"):
     )
 
 
-def test_store_over_the_free_quota_is_rejected_and_leaves_no_temp_file(storage):
+@pytest.mark.parametrize("storage", QUOTA_SETTINGS, indirect=True)
+@pytest.mark.parametrize("plan", [FREE_PLAN, PAID_PLAN])
+def test_store_over_the_plan_quota_is_rejected_and_leaves_no_file(storage, plan):
     _, database, store = storage
     tenant = database.create_tenant(email="a@example.com", inbox_local="a.1")
     scope = TenantScope(tenant.id)
-    _charge(database, scope, FREE_QUOTA_BYTES)
+    database.set_tenant_plan(tenant.id, plan)
+    allowance = store.settings.paid_quota_bytes if plan == PAID_PLAN else store.settings.free_quota_bytes
+    _charge(database, scope, allowance)
 
     with pytest.raises(StorageQuotaExceeded) as excinfo:
         store.store_bytes(scope, _epub("Over"), filename="over.epub", kind="book", source="email")
@@ -367,44 +377,46 @@ def test_store_over_the_free_quota_is_rejected_and_leaves_no_temp_file(storage):
     assert excinfo.value.status_code == 413
     assert database.count_items(scope) == 1
     assert list(store.temp_dir.iterdir()) == []
+    assert list(store.items_dir.rglob("*.epub")) == []
 
 
-def test_a_store_that_exactly_fills_the_free_quota_is_accepted(storage):
+@pytest.mark.parametrize("storage", QUOTA_SETTINGS, indirect=True)
+@pytest.mark.parametrize("plan", [FREE_PLAN, PAID_PLAN])
+def test_a_store_that_exactly_fills_the_plan_quota_is_accepted(storage, plan):
     """The cap is what may be stored, not what may be approached: usage + size == quota
     fits. Kills the off-by-one that would reject the item that exactly fills the account."""
     _, database, store = storage
     tenant = database.create_tenant(email="a@example.com", inbox_local="a.1")
     scope = TenantScope(tenant.id)
     payload = _epub("Exact")
-    _charge(database, scope, FREE_QUOTA_BYTES - len(payload))
+    database.set_tenant_plan(tenant.id, plan)
+    allowance = store.settings.paid_quota_bytes if plan == PAID_PLAN else store.settings.free_quota_bytes
+    _charge(database, scope, allowance - len(payload))
 
-    assert store.store_bytes(scope, payload, filename="e.epub", kind="book", source="email").duplicate is False
+    result = store.store_bytes(scope, payload, filename="e.epub", kind="book", source="email")
+    assert result.duplicate is False
+    assert store.path_for(result.item).read_bytes() == payload
+    assert database.tenant_storage_bytes(scope) == allowance
 
 
+@pytest.mark.parametrize("storage", QUOTA_SETTINGS, indirect=True)
 def test_the_same_store_is_accepted_on_the_paid_plan(storage):
     _, database, store = storage
     tenant = database.create_tenant(email="a@example.com", inbox_local="a.1")
     scope = TenantScope(tenant.id)
-    _charge(database, scope, FREE_QUOTA_BYTES)
+    _charge(database, scope, store.settings.free_quota_bytes)
+    payload = _epub("Room")
+    with pytest.raises(StorageQuotaExceeded):
+        store.store_bytes(scope, payload, filename="room.epub", kind="book", source="email")
     assert database.set_tenant_plan(tenant.id, PAID_PLAN) is True
 
-    result = store.store_bytes(scope, _epub("Room"), filename="room.epub", kind="book", source="email")
+    result = store.store_bytes(scope, payload, filename="room.epub", kind="book", source="email")
 
     assert result.duplicate is False
     assert database.count_items(scope) == 2
 
 
-def test_a_paid_tenant_is_still_capped_at_the_paid_quota(storage):
-    _, database, store = storage
-    tenant = database.create_tenant(email="a@example.com", inbox_local="a.1")
-    scope = TenantScope(tenant.id)
-    _charge(database, scope, PAID_QUOTA_BYTES)
-    database.set_tenant_plan(tenant.id, PAID_PLAN)
-
-    with pytest.raises(StorageQuotaExceeded):
-        store.store_bytes(scope, _epub("Too much"), filename="t.epub", kind="book", source="email")
-
-
+@pytest.mark.parametrize("storage", QUOTA_SETTINGS, indirect=True)
 def test_re_sending_a_file_already_stored_stays_a_duplicate_over_quota(storage):
     """A duplicate adds no bytes, so it must not be rejected once the account is full --
     otherwise a device that re-sends on every sync starts failing at the cap. Pins the
@@ -415,7 +427,7 @@ def test_re_sending_a_file_already_stored_stays_a_duplicate_over_quota(storage):
     scope = TenantScope(tenant.id)
     payload = _epub("Resent")
     first = store.store_bytes(scope, payload, filename="r.epub", kind="book", source="email")
-    _charge(database, scope, FREE_QUOTA_BYTES)
+    _charge(database, scope, store.settings.free_quota_bytes)
 
     second = store.store_bytes(scope, payload, filename="r.epub", kind="book", source="email")
 
@@ -423,15 +435,35 @@ def test_re_sending_a_file_already_stored_stays_a_duplicate_over_quota(storage):
     assert second.item.id == first.item.id
 
 
+@pytest.mark.parametrize("storage", QUOTA_SETTINGS, indirect=True)
 def test_one_tenants_usage_does_not_fill_anothers_quota(storage):
     _, database, store = storage
     alice = database.create_tenant(email="a@example.com", inbox_local="a.1")
     bob = database.create_tenant(email="b@example.com", inbox_local="b.2")
-    _charge(database, TenantScope(alice.id), FREE_QUOTA_BYTES)
+    _charge(database, TenantScope(alice.id), store.settings.free_quota_bytes)
 
     result = store.store_bytes(TenantScope(bob.id), _epub("Bob's"), filename="b.epub", kind="book", source="email")
 
     assert result.duplicate is False
+
+
+def test_lowering_a_quota_preserves_existing_files_and_allows_deletion(storage):
+    settings, database, store = storage
+    tenant = database.create_tenant(email="a@example.com", inbox_local="a.1")
+    scope = TenantScope(tenant.id)
+    payload = _epub("Existing")
+    item = store.store_bytes(scope, payload, filename="e.epub", kind="book", source="email").item
+    restarted = ItemStorage(replace(settings, free_quota_bytes=1), database)
+
+    with pytest.raises(StorageQuotaExceeded):
+        restarted.store_bytes(scope, _epub("New"), filename="n.epub", kind="book", source="email")
+
+    assert database.get_item(scope, item.id) == item
+    assert restarted.path_for(item).read_bytes() == payload
+    assert restarted.store_bytes(scope, payload, filename="e.epub", kind="book", source="email").duplicate
+    assert restarted.delete(scope, item.id)
+    assert not restarted.path_for(item).exists()
+    assert database.count_items(scope) == 0
 
 
 def _disk(monkeypatch, *, total: int, free: int) -> None:
@@ -470,7 +502,7 @@ def test_a_full_account_is_told_it_is_full_before_the_disk_is_blamed(storage, mo
     _, database, store = storage
     tenant = database.create_tenant(email="a@example.com", inbox_local="a.1")
     scope = TenantScope(tenant.id)
-    _charge(database, scope, FREE_QUOTA_BYTES)
+    _charge(database, scope, store.settings.free_quota_bytes)
     _disk(monkeypatch, total=5 * 1024**3, free=DISK_FREE_FLOOR_BYTES - 1)
 
     with pytest.raises(StorageQuotaExceeded):

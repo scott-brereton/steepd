@@ -35,9 +35,10 @@ source for it, under the AGPL, so you can also run your own.
 
 ## The hosted service
 
-steepd.app is in open beta and free while it is: 100 MB of storage, items kept seven
-days. There is no paid plan yet. It is a one-person project; there is no support desk,
-and no promise about uptime or data retention beyond what the terms page says.
+steepd.app is in open beta and free while it is: 100 MB of storage, with items kept
+60 days. There is no paid plan yet. It is a one-person
+project; there is no support desk, and no promise about uptime or data retention beyond
+what the terms page says.
 
 ## Running your own
 
@@ -118,8 +119,31 @@ Optional, each feature off until set:
 | `SUPPORT_INBOUND_ADDRESS`, `SUPPORT_FORWARD_ADDRESS` | Set together, with `MAIL_FROM_ADDRESS`, to relay mail sent to an address on a Resend-receiving domain to your own mailbox. Only useful if Resend receives your apex domain. |
 | `MAX_UPLOAD_BYTES`, `MAX_ARCHIVE_UNCOMPRESSED_BYTES`, `MAX_ARCHIVE_MEMBERS`, `MAX_COMPRESSION_RATIO`, `WEBHOOK_MAX_BYTES`, `NEWSLETTER_MAX_BODY_BYTES`, `NEWSLETTER_MAX_IMAGE_BYTES`, `NEWSLETTER_MAX_TOTAL_IMAGE_BYTES`, `SERVICE_CHECK_TIMEOUT_SECONDS` | Size and time limits. The defaults in `src/steepd/config.py` are the ones the hosted service runs with. |
 
-Plan limits (storage per account, retention) live in `src/steepd/plans.py` and are not
-environment variables.
+Plan limits are optional environment variables, read once at startup:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `FREE_QUOTA_BYTES` | `104857600` (100 MiB) | Storage per free account. |
+| `PAID_QUOTA_BYTES` | `5368709120` (5 GiB) | Storage per paid account. |
+| `FREE_RETENTION_DAYS` | `7` | Whole days a free item is kept, measured from its original arrival. |
+
+The hosted service sets `FREE_QUOTA_BYTES=104857600` and `FREE_RETENTION_DAYS=60`.
+The table above lists the defaults for an installation with these variables unset.
+
+Unset variables use these defaults. Values must be positive integers; surrounding
+whitespace is allowed, but blank values, fractions, and unit suffixes such as `100MB`
+or `7d` are rejected. Quotas cannot exceed `9223372036854775807` bytes; retention cannot
+exceed `36500` days. Invalid values prevent startup. Paid items are kept until deleted.
+Upload limits and service disk-headroom checks still apply independently of plan quotas.
+
+Restart or redeploy after changing these variables. The new limits apply to existing
+accounts and items. Lowering a quota below current usage refuses new distinct items;
+it does not remove existing files or prevent downloads, deletion, or duplicate delivery.
+Shortening free retention can delete older items on the first production cleanup pass
+after restart, which runs immediately and then hourly. Increasing retention keeps
+remaining eligible items longer but cannot recover deleted files. Rolling back the
+variables likewise cannot restore deleted files. Development runs have no automatic
+cleanup thread. Changing an account's plan still takes effect without a restart.
 
 ## What is deliberately not here
 

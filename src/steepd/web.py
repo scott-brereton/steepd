@@ -56,7 +56,7 @@ from steepd.inboxnames import (
 )
 from steepd.models import Item, RefusedSender, Tenant
 from steepd.outbound import OutboundEmailDisabled, OutboundEmailError, send_email
-from steepd.plans import FREE_PLAN, FREE_RETENTION, PAID_PLAN, quota_bytes, retention_for
+from steepd.plans import FREE_PLAN, PAID_PLAN, quota_bytes, retention_for
 from steepd.storage import ItemStorage
 from steepd.tenancy import TenantScope
 
@@ -575,6 +575,10 @@ def _human_size(size_bytes: int) -> str:
     return f"{megabytes / 1024:.1f}".removesuffix(".0") + " GB"
 
 
+def _human_days(days: int) -> str:
+    return f"{days} {'day' if days == 1 else 'days'}"
+
+
 def _remaining_retention_days(item: Item, retention: timedelta, *, now: datetime) -> int:
     created_at = datetime.fromisoformat(item.created_at)
     if created_at.tzinfo is None:
@@ -588,8 +592,7 @@ def _item_row(item: Item, *, retention: timedelta | None, now: datetime) -> str:
     removal_note = ""
     if retention is not None:
         days = _remaining_retention_days(item, retention, now=now)
-        unit = "day" if days == 1 else "days"
-        removal_note = f'<span class="meta">removed in {days} {unit}</span>'
+        removal_note = f'<span class="meta">removed in {_human_days(days)}</span>'
     return (
         "<li><div>"
         f'<span class="title">{html.escape(item.title)}</span>'
@@ -601,14 +604,13 @@ def _item_row(item: Item, *, retention: timedelta | None, now: datetime) -> str:
     )
 
 
-def _plan_card(tenant: Tenant, storage_bytes: int, retention: timedelta | None) -> str:
-    allowance = quota_bytes(tenant.plan)
+def _plan_card(tenant: Tenant, storage_bytes: int, retention: timedelta | None, *, allowance: int) -> str:
     percentage = max(0.0, storage_bytes / allowance * 100) if allowance else 0.0
     fill_width = min(percentage, 100.0)
     width = f"{fill_width:.4f}".rstrip("0").rstrip(".")
     plan_name = "Paid" if tenant.plan == PAID_PLAN else "Free"
     retention_note = (
-        f'<p class="fineprint">Items are kept for {retention.days} days.</p>' if retention is not None else ""
+        f'<p class="fineprint">Items are kept for {_human_days(retention.days)}.</p>' if retention is not None else ""
     )
     warning = (
         '<p class="fineprint">New deliveries are refused once the storage limit is reached.</p>'
@@ -785,6 +787,7 @@ def _account_page(
     tenant: Tenant,
     view: LibraryView,
     *,
+    settings: Settings,
     senders: list[str],
     refused: list[RefusedSender],
     storage_bytes: int,
@@ -795,7 +798,8 @@ def _account_page(
     error: str = "",
     status_code: int = status.HTTP_200_OK,
 ) -> HTMLResponse:
-    retention = retention_for(tenant.plan)
+    retention = retention_for(tenant.plan, settings=settings)
+    allowance = quota_bytes(tenant.plan, settings=settings)
     listing = _library_section(view, retention=retention, now=datetime.now(UTC))
     verification = _email_verification_section(
         tenant,
@@ -806,7 +810,7 @@ def _account_page(
         "Steepd — your account",
         f"{_notice(error)}"
         "<h1>Your account</h1>"
-        f"{_plan_card(tenant, storage_bytes, retention)}"
+        f"{_plan_card(tenant, storage_bytes, retention, allowance=allowance)}"
         f'<div class="card"><span class="label">Send books, newsletters, and links here</span>'
         f"<code>{html.escape(inbox_address)}</code></div>"
         f'<div class="card"><span class="label">Catalogue address for your reader</span>'
@@ -1060,8 +1064,8 @@ KOREADER_KOBO_URL = "https://www.mobileread.com/forums/showthread.php?t=314220"
 KINDLE_MODDING_URL = "https://kindlemodding.org/"
 
 
-def _free_quota() -> str:
-    return _human_size(quota_bytes(FREE_PLAN))
+def _free_quota(settings: Settings) -> str:
+    return _human_size(quota_bytes(FREE_PLAN, settings=settings))
 
 
 def _footer(source_url: str) -> str:
@@ -1072,7 +1076,7 @@ def _footer(source_url: str) -> str:
     )
 
 
-def _tiers() -> str:
+def _tiers(settings: Settings) -> str:
     """Three cards, only one of which is buyable.
 
     The paid two are shown muted and without a button on purpose: the beta is a demand
@@ -1082,15 +1086,16 @@ def _tiers() -> str:
         '<div class="tiers">'
         '<div class="tier live"><span class="amt">Free</span>'
         '<span class="per">what you get today</span>'
-        f"<ul><li>{_free_quota()}</li><li>Kept {FREE_RETENTION.days} days</li></ul></div>"
+        f"<ul><li>{_free_quota(settings)}</li><li>Kept {_human_days(settings.free_retention.days)}</li></ul></div>"
         '<div class="tier soon"><span class="amt">$5</span><span class="per">per month</span>'
-        f"<ul><li>{_human_size(quota_bytes(PAID_PLAN))}</li><li>Kept until deleted</li>"
+        f"<ul><li>{_human_size(quota_bytes(PAID_PLAN, settings=settings))}</li><li>Kept until deleted</li>"
         '<li class="muted">coming soon</li></ul></div>'
         "</div>"
     )
 
 
-def _landing_page(*, source_url: str = "", inbox_domain: str = "") -> HTMLResponse:
+def _landing_page(settings: Settings) -> HTMLResponse:
+    source_url = settings.source_repository_url
     signup = _email_form("/signup", LANDING_SUBMIT_LABEL, "")
     return _page(
         "Steepd — reading for small e-ink readers",
@@ -1098,7 +1103,7 @@ def _landing_page(*, source_url: str = "", inbox_domain: str = "") -> HTMLRespon
         "<h1>Email it. Read it on your e&#8209;reader.</h1>"
         '<p class="lede">For small e&#8209;ink readers with no store, no '
         "Send&#8209;to&#8209;Kindle and no sync — where a catalogue feed is the only way in.</p>"
-        f"{signup}{LANDING_FINEPRINT}{_DIAGRAM}{_walkthrough(inbox_domain)}</div>"
+        f"{signup}{LANDING_FINEPRINT}{_DIAGRAM}{_walkthrough(settings.inbox_domain)}</div>"
         "<section><h2>Setup</h2>"
         '<p class="small">You get an address to email things to, and a feed address. Type the '
         "feed into your reader once. No app, no plugin, no cable.</p>"
@@ -1111,7 +1116,7 @@ def _landing_page(*, source_url: str = "", inbox_domain: str = "") -> HTMLRespon
         '<p class="small">Steepd pulls the readable part from public webpages and flattens the nested '
         "tables in email newsletters. It keeps tables holding real data, drops tracking pixels, and "
         "stores images in the file so everything works offline.</p></section>"
-        f"<section><h2>Pricing</h2>{_tiers()}"
+        f"<section><h2>Pricing</h2>{_tiers(settings)}"
         '<p class="small muted">Paid plans arrive after the beta. Libraries built during the beta '
         "carry over.</p></section>"
         "<section><h2>Will it work on mine?</h2>"
@@ -1150,7 +1155,8 @@ def _landing_page(*, source_url: str = "", inbox_domain: str = "") -> HTMLRespon
     )
 
 
-def _privacy_page(*, contact: str = "", source_url: str = "") -> HTMLResponse:
+def _privacy_page(settings: Settings) -> HTMLResponse:
+    contact = settings.support_contact
     questions = ""
     if contact:
         safe = html.escape(contact)
@@ -1182,7 +1188,7 @@ def _privacy_page(*, contact: str = "", source_url: str = "") -> HTMLResponse:
         "<p>There is no analytics, no advertising, no third-party script and no tracking cookie. "
         "One cookie is set, and it exists only to keep you signed in.</p></section>"
         "<section><h2>How long we keep it</h2>"
-        f"<p>On the free plan an item is deleted automatically {FREE_RETENTION.days} days after it "
+        f"<p>On the free plan an item is deleted automatically {_human_days(settings.free_retention.days)} after it "
         "arrives, and the stored file goes with the record of it. Deleting an item yourself deletes "
         "it straight away. Deleting your account deletes your library and your stored files, and "
         "your inbox address is held back so nobody else can ever be sent your mail.</p></section>"
@@ -1192,11 +1198,12 @@ def _privacy_page(*, contact: str = "", source_url: str = "") -> HTMLResponse:
         "handles the messages we send. Our logs record that a request happened, never what was in it "
         "— no message content and no sign-in links.</p></section>"
         f"{questions}"
-        f"{_footer(source_url)}",
+        f"{_footer(settings.source_repository_url)}",
     )
 
 
-def _terms_page(*, source_url: str = "") -> HTMLResponse:
+def _terms_page(settings: Settings) -> HTMLResponse:
+    source_url = settings.source_repository_url
     licence = (
         f'Steepd is licensed under AGPL&#8209;3.0 and the <a href="{html.escape(source_url, quote=True)}">'
         "source is published</a>."
@@ -1213,8 +1220,8 @@ def _terms_page(*, source_url: str = "") -> HTMLResponse:
         "every item in your library, so take a copy of anything you cannot afford to lose rather "
         "than trusting us to still have it.</p></section>"
         "<section><h2>What the free plan gives you</h2>"
-        f"<p>{_free_quota()} of storage, with each item deleted automatically "
-        f"{FREE_RETENTION.days} days after it arrives. Once you are at the limit new deliveries are "
+        f"<p>{_free_quota(settings)} of storage, with each item deleted automatically "
+        f"{_human_days(settings.free_retention.days)} after it arrives. Once you are at the limit new deliveries are "
         "refused, rather than something older being quietly thrown away.</p></section>"
         "<section><h2>Using it</h2>"
         "<p>One account per person. Do not use Steepd to store unlawful content, or content you have "
@@ -1762,6 +1769,7 @@ def build_web_router(settings: Settings, database: Database, storage: ItemStorag
         return _account_page(
             tenant,
             _library_view(scope, query=query, sort=sort, page=page),
+            settings=settings,
             senders=database.list_allowed_senders(tenant.id),
             refused=database.list_refused_senders(tenant.id),
             storage_bytes=database.tenant_storage_bytes(scope),
@@ -1848,27 +1856,15 @@ def build_web_router(settings: Settings, database: Database, storage: ItemStorag
             # Straight to the address page while there is no address, rather than to
             # /account only to be sent back here by the session dependency.
             return _redirect("/account" if session.tenant.inbox_confirmed_at else "/account/address")
-        return _public(
-            request,
-            _landing_page(
-                source_url=settings.source_repository_url,
-                inbox_domain=settings.inbox_domain,
-            ),
-        )
+        return _public(request, _landing_page(settings))
 
     @router.get("/privacy", include_in_schema=False)
     def privacy(request: Request) -> Response:
-        return _public(
-            request,
-            _privacy_page(
-                contact=settings.support_contact,
-                source_url=settings.source_repository_url,
-            ),
-        )
+        return _public(request, _privacy_page(settings))
 
     @router.get("/terms", include_in_schema=False)
     def terms(request: Request) -> Response:
-        return _public(request, _terms_page(source_url=settings.source_repository_url))
+        return _public(request, _terms_page(settings))
 
     @router.get("/devices", include_in_schema=False)
     def devices(request: Request) -> Response:

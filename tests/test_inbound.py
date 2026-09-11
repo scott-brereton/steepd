@@ -945,9 +945,8 @@ def test_a_full_account_refuses_a_newsletter_as_a_rejection_not_an_error(tmp_pat
     """Over quota, the converted article cannot be stored. That is final -- a retry meets
     the same full account -- so it is a rejection the reader hears about, and the event is
     recorded as done rather than left for the provider to retry."""
-    (_, database, _, service, tenants, provider), sent = _replying_env(tmp_path, monkeypatch)
+    (_, database, _, service, tenants, provider), sent = _replying_env(tmp_path, monkeypatch, free_quota_bytes=1)
     scope = TenantScope(tenants[0].id)
-    monkeypatch.setattr("steepd.storage.quota_bytes", lambda plan: 1)
     provider.queue_email(to="a.1@read.steepd.app", subject="Fwd: Monday note", html=ARTICLE_BODY)
     body, headers = provider.signed_event()
 

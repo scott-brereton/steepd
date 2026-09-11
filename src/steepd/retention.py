@@ -53,7 +53,7 @@ def run_sweep(database: Database, storage: ItemStorage, *, now: datetime | None 
 
     items_deleted = 0
     for plan in KNOWN_PLANS:
-        retention = retention_for(plan)
+        retention = retention_for(plan, settings=storage.settings)
         if retention is None:
             continue
         cutoff = (moment - retention).isoformat()

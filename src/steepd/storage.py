@@ -229,7 +229,7 @@ class ItemStorage:
         skipping the check.
         """
         tenant = self.database.tenant_by_id(scope.tenant_id)
-        allowance = quota_bytes(tenant.plan if tenant is not None else FREE_PLAN)
+        allowance = quota_bytes(tenant.plan if tenant is not None else FREE_PLAN, settings=self.settings)
         if self.database.tenant_storage_bytes(scope) + incoming_bytes > allowance:
             raise StorageQuotaExceeded("Storing this item would exceed the plan's storage limit")
         # The whole volume, not this account. Checked after the allowance so a full account

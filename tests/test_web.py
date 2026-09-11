@@ -23,7 +23,7 @@ from steepd.auth import issue_magic_token
 from steepd.config import Settings
 from steepd.epubgen import build_epub
 from steepd.models import Item
-from steepd.plans import FREE_QUOTA_BYTES, FREE_RETENTION, PAID_PLAN, PAID_QUOTA_BYTES
+from steepd.plans import PAID_PLAN
 from steepd.tenancy import TenantScope
 from steepd.web import (
     MARKDOWN_DROPPED_TAGS,
@@ -441,8 +441,8 @@ def test_a_free_account_shows_its_plan_usage_retention_and_item_removal(web):
     assert '<span class="title">Free</span>' in body
     assert "100 MB" in body
     assert f"{_human_size(item.size_bytes)} of 100 MB used" in body
-    assert f"Items are kept for {FREE_RETENTION.days} days." in body
-    assert f"removed in {FREE_RETENTION.days} days" in body
+    assert f"Items are kept for {client.app.state.settings.free_retention.days} days." in body
+    assert f"removed in {client.app.state.settings.free_retention.days} days" in body
 
 
 def test_a_paid_account_shows_its_larger_quota_without_retention_notes(web):
@@ -465,7 +465,7 @@ def test_the_usage_meter_width_reflects_actual_storage(web):
     client, sent = web
     _sign_up(client, sent)
     tenant = client.app.state.database.tenant_by_email(EMAIL)
-    _insert_sized_item(client, tenant, size_bytes=FREE_QUOTA_BYTES // 4)
+    _insert_sized_item(client, tenant, size_bytes=client.app.state.settings.free_quota_bytes // 4)
 
     body = client.get("/account").text
     fill = re.search(r'class="usage-meter-fill"[^>]*style="[^"]*width:\s*([\d.]+)%', body)
@@ -482,9 +482,67 @@ def test_the_account_warns_near_the_storage_limit_but_not_at_low_usage(web):
 
     assert warning not in client.get("/account").text
 
-    _insert_sized_item(client, tenant, size_bytes=FREE_QUOTA_BYTES * 86 // 100)
+    _insert_sized_item(client, tenant, size_bytes=client.app.state.settings.free_quota_bytes * 86 // 100)
 
     assert warning in client.get("/account").text
+
+
+@pytest.mark.parametrize("accept", ["text/html", "text/markdown"])
+def test_configured_plan_limits_stay_consistent_and_isolated_between_apps(tmp_path, monkeypatch, accept):
+    apps = []
+    for free_mb, paid_gb, days, period in [(200, 2, 1, "1 day"), (100, 5, 60, "60 days")]:
+        client, sent = _build_client(
+            tmp_path / str(days), monkeypatch,
+            free_quota_bytes=free_mb * 1024**2,
+            paid_quota_bytes=paid_gb * 1024**3,
+            free_retention=timedelta(days=days),
+        )
+        _sign_up(client, sent)
+        tenant = client.app.state.database.tenant_by_email(EMAIL)
+        item = _store_item(client, tenant)
+        apps.append((client, tenant, item, free_mb, paid_gb, period))
+
+    # Read both apps after constructing both: a global changed by the second app would
+    # advertise or enforce its limits for the first app as well.
+    for client, tenant, item, free_mb, paid_gb, period in apps:
+        with TestClient(client.app, base_url=BASE_URL) as public:
+            landing = public.get("/", headers={"Accept": accept})
+            assert landing.status_code == 200
+            assert landing.headers["content-type"].startswith(accept)
+            assert f"{free_mb} MB" in landing.text
+            assert f"{paid_gb} GB" in landing.text
+            assert f"Kept {period}" in landing.text
+            assert "Kept until deleted" in landing.text
+            for path in ("/privacy", "/terms"):
+                page = public.get(path, headers={"Accept": accept})
+                assert page.status_code == 200
+                assert page.headers["content-type"].startswith(accept)
+                assert f"deleted automatically {period} after it" in page.text
+                if path == "/terms":
+                    assert f"{free_mb} MB of storage" in page.text
+
+        body = client.get("/account").text
+        assert f"of {free_mb} MB used" in body
+        assert f"Items are kept for {period}." in body
+        assert f"removed in {period}" in body
+
+        allowance = free_mb * 1024**2
+        _insert_sized_item(client, tenant, size_bytes=allowance * 84 // 100 - item.size_bytes)
+        warning = "New deliveries are refused once the storage limit is reached."
+        assert warning not in client.get("/account").text
+        _insert_sized_item(client, tenant, size_bytes=allowance // 100)
+        body = client.get("/account").text
+        assert warning in body
+        meter = BeautifulSoup(body, "html.parser").find(attrs={"role": "meter"})
+        assert meter["aria-valuemax"] == str(allowance)
+        assert meter["aria-valuenow"] == str(allowance * 85 // 100)
+        assert meter.find(class_="usage-meter-fill")["style"] == "width: 85%"
+
+        client.app.state.database.set_tenant_plan(tenant.id, PAID_PLAN)
+        body = client.get("/account").text
+        assert f"of {paid_gb} GB used" in body
+        assert "Items are kept for" not in body
+        assert "removed in" not in body
 
 
 # -- deletion ----------------------------------------------------------------
@@ -929,18 +987,18 @@ def test_the_landing_diagram_shows_all_three_email_inputs_and_saved(web):
     assert "Saved" in visible
 
 
-def test_the_landing_pricing_quotes_the_plans_module_rather_than_a_number(web):
+def test_the_landing_pricing_quotes_the_app_settings(web):
     """The free card describes the live product, so its numbers have to be the ones the
     quota and the retention sweep actually enforce. Both expectations are computed from
-    steepd.plans here: a page that hardcoded "100 MB" or "7 days" would keep saying so
+    the app settings here: a page that hardcoded "100 MB" or "7 days" would keep saying so
     after the plan changed, and the first person to notice would be a user at their limit.
     """
     client, _ = web
     body = client.get("/").text
 
-    assert _human_size(FREE_QUOTA_BYTES) in body
-    assert f"Kept {FREE_RETENTION.days} days" in body
-    assert _human_size(PAID_QUOTA_BYTES) in body
+    assert _human_size(client.app.state.settings.free_quota_bytes) in body
+    assert f"Kept {client.app.state.settings.free_retention.days} days" in body
+    assert _human_size(client.app.state.settings.paid_quota_bytes) in body
     assert body.count("coming soon") == 1
     assert "Paid plans arrive after the beta" in body
 
@@ -1143,12 +1201,12 @@ def test_the_account_names_links_as_an_inbox_option(web):
     assert "Send books, newsletters, and links here" in client.get("/account").text
 
 
-def test_the_privacy_retention_number_comes_from_the_plans_module(web):
+def test_the_privacy_retention_number_comes_from_the_app_settings(web):
     """The page promises automatic deletion on a schedule the retention sweep owns. The
-    expectation is computed from FREE_RETENTION so the promise and the sweep cannot drift."""
+    expectation is computed from app settings so the promise and the sweep cannot drift."""
     client, _ = web
     body = client.get("/privacy").text
-    assert f"deleted automatically {FREE_RETENTION.days} days after it" in body
+    assert f"deleted automatically {client.app.state.settings.free_retention.days} days after it" in body
 
 
 def test_the_terms_page_is_honest_about_the_beta(web):
@@ -1163,11 +1221,11 @@ def test_the_terms_page_is_honest_about_the_beta(web):
     assert "AGPL" in response.text
 
 
-def test_the_terms_free_plan_limits_come_from_the_plans_module(web):
+def test_the_terms_free_plan_limits_come_from_the_app_settings(web):
     client, _ = web
     body = client.get("/terms").text
-    assert f"{_human_size(FREE_QUOTA_BYTES)} of storage" in body
-    assert f"deleted automatically {FREE_RETENTION.days} days after it" in body
+    assert f"{_human_size(client.app.state.settings.free_quota_bytes)} of storage" in body
+    assert f"deleted automatically {client.app.state.settings.free_retention.days} days after it" in body
 
 
 # -- the setup page -----------------------------------------------------------
@@ -1348,7 +1406,7 @@ def test_the_privacy_page_in_markdown_says_what_the_html_says(web):
     body = client.get("/privacy", headers=MARKDOWN).text
 
     assert "# Privacy" in body
-    assert f"deleted automatically {FREE_RETENTION.days} days after it" in body
+    assert f"deleted automatically {client.app.state.settings.free_retention.days} days after it" in body
     assert "## What we do not do" in body
 
 

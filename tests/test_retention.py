@@ -1,4 +1,5 @@
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
@@ -15,11 +16,15 @@ from steepd.tenancy import TenantScope
 
 NOW = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
 PLUS_TEN = timezone(timedelta(hours=10))
+RETENTION_SETTINGS = [
+    pytest.param({}, id="default"),
+    pytest.param({"free_retention": timedelta(days=14)}, id="custom"),
+]
 
 
 @pytest.fixture
-def service(tmp_path):
-    settings = Settings(data_dir=tmp_path, public_base_url="http://localhost:8000")
+def service(tmp_path, request):
+    settings = Settings(data_dir=tmp_path, public_base_url="http://localhost:8000", **getattr(request, "param", {}))
     database = Database(tmp_path / "steepd.sqlite3")
     database.initialize()
     storage = ItemStorage(settings, database)
@@ -58,24 +63,29 @@ def test_old_webhook_event_rows_are_pruned_and_recent_ones_kept(service):
     assert database.webhook_event_exists("resend", "evt-new")
 
 
-def test_a_free_tenants_item_past_seven_days_goes_and_a_younger_one_stays(service):
+@pytest.mark.parametrize("service", RETENTION_SETTINGS, indirect=True)
+def test_only_free_items_strictly_past_retention_are_removed(service):
     database, storage = service
     tenant = database.create_tenant(email="a@example.com", inbox_local="a.1")
-    old_path, old_item = _stored(database, storage, tenant.id, "Old", age_days=8)
-    fresh_path, fresh_item = _stored(database, storage, tenant.id, "Fresh", age_days=6)
+    days = storage.settings.free_retention.days
+    old_path, old_item = _stored(database, storage, tenant.id, "Old", age_days=days + 1 / 86400)
+    fresh_path, fresh_item = _stored(database, storage, tenant.id, "Fresh", age_days=days - 1 / 86400)
+    cutoff_path, cutoff_item = _stored(database, storage, tenant.id, "At cutoff", age_days=days)
 
     result = run_sweep(database, storage, now=NOW)
 
     assert result.items_deleted == 1
     scope = TenantScope(tenant.id)
-    assert [item.id for item in database.list_items(scope)] == [fresh_item.id]
+    assert {item.id for item in database.list_items(scope)} == {fresh_item.id, cutoff_item.id}
     assert database.get_item(scope, old_item.id) is None
     # The file goes with the row: an expired item that leaves its bytes on disk is a quota
     # the tenant can never get back.
     assert not old_path.exists()
     assert fresh_path.exists()
+    assert cutoff_path.exists()
 
 
+@pytest.mark.parametrize("service", RETENTION_SETTINGS, indirect=True)
 def test_a_paid_tenants_old_item_is_kept_until_they_delete_it(service):
     database, storage = service
     tenant = database.create_tenant(email="a@example.com", inbox_local="a.1")
@@ -89,6 +99,7 @@ def test_a_paid_tenants_old_item_is_kept_until_they_delete_it(service):
     assert path.exists()
 
 
+@pytest.mark.parametrize("service", RETENTION_SETTINGS, indirect=True)
 def test_upgrading_before_the_sweep_rescues_items_already_past_retention(service):
     """The plan-at-sweep-time property. Retention is not stamped on the item, so paying
     protects what is already stored -- there is no expiry to rewrite and no window in which
@@ -106,6 +117,7 @@ def test_upgrading_before_the_sweep_rescues_items_already_past_retention(service
     assert path.exists()
 
 
+@pytest.mark.parametrize("service", RETENTION_SETTINGS, indirect=True)
 def test_downgrading_puts_old_items_back_in_scope(service):
     """The other half of the same property, and the reason it is not merely convenient:
     an account that stops paying must stop consuming paid-tier storage."""
@@ -121,6 +133,22 @@ def test_downgrading_puts_old_items_back_in_scope(service):
     assert result.items_deleted == 1
     assert database.get_item(TenantScope(tenant.id), item.id) is None
     assert not path.exists()
+
+
+def test_changed_retention_applies_to_existing_items_using_their_original_arrival(service):
+    database, storage = service
+    tenant = database.create_tenant(email="a@example.com", inbox_local="a.1")
+    path, item = _stored(database, storage, tenant.id, "Existing", age_days=8)
+    longer = ItemStorage(replace(storage.settings, free_retention=timedelta(days=14)), database)
+
+    assert run_sweep(database, longer, now=NOW).items_deleted == 0
+    assert path.exists()
+    assert database.get_item(TenantScope(tenant.id), item.id).created_at == (NOW - timedelta(days=8)).isoformat()
+
+    shorter = ItemStorage(replace(storage.settings, free_retention=timedelta(days=3)), database)
+    assert run_sweep(database, shorter, now=NOW).items_deleted == 1
+    assert not path.exists()
+    assert database.get_item(TenantScope(tenant.id), item.id) is None
 
 
 def test_one_tenants_expiry_leaves_another_tenants_library_alone(service):
@@ -240,7 +268,7 @@ class _IdleDatabase:
         return 0
 
 
-def test_the_thread_is_a_daemon_that_keeps_sweeping(monkeypatch):
+def test_the_thread_is_a_daemon_that_keeps_sweeping(monkeypatch, service):
     """Daemon so shutdown never waits on a sleeping sweep, and named so it is identifiable
     in a thread dump. run_sweep is stubbed rather than slept on: this test is about the
     loop, and a real interval would make it a timing test."""
@@ -253,7 +281,7 @@ def test_the_thread_is_a_daemon_that_keeps_sweeping(monkeypatch):
         return SweepResult(items_deleted=0, sessions_pruned=0, magic_tokens_pruned=0)
 
     monkeypatch.setattr(retention, "run_sweep", fake_sweep)
-    thread = start_retention_thread(_IdleDatabase(), None, interval_seconds=0.05)
+    thread = start_retention_thread(_IdleDatabase(), service[1], interval_seconds=0.05)
 
     assert swept.wait(timeout=5.0), "the retention thread never ran a sweep"
     assert thread.daemon is True
@@ -261,7 +289,7 @@ def test_the_thread_is_a_daemon_that_keeps_sweeping(monkeypatch):
     assert calls[0] is None, "the loop must sweep against the real clock"
 
 
-def test_a_failing_pass_does_not_kill_the_thread(monkeypatch):
+def test_a_failing_pass_does_not_kill_the_thread(monkeypatch, service):
     """Retention that dies on one exception is worse than no retention: nothing else
     reports that items have stopped expiring."""
     recovered = threading.Event()
@@ -275,7 +303,7 @@ def test_a_failing_pass_does_not_kill_the_thread(monkeypatch):
         return SweepResult(items_deleted=0, sessions_pruned=0, magic_tokens_pruned=0)
 
     monkeypatch.setattr(retention, "run_sweep", fake_sweep)
-    thread = start_retention_thread(_IdleDatabase(), None, interval_seconds=0.05)
+    thread = start_retention_thread(_IdleDatabase(), service[1], interval_seconds=0.05)
 
     assert recovered.wait(timeout=5.0), "the thread stopped after the first failing pass"
     assert thread.is_alive()

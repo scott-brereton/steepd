@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
+
+DEFAULT_FREE_QUOTA_BYTES = 100 * 1024 * 1024
+DEFAULT_PAID_QUOTA_BYTES = 5 * 1024 * 1024 * 1024
+DEFAULT_FREE_RETENTION = timedelta(days=7)
 
 
 class ConfigurationError(RuntimeError):
@@ -108,6 +113,9 @@ class Settings:
     # Where support_inbound_address is relayed to: the operator's real mailbox. Not
     # casefolded -- it is a delivery destination, and local parts are case-sensitive.
     support_forward_address: str = ""
+    free_quota_bytes: int = DEFAULT_FREE_QUOTA_BYTES
+    paid_quota_bytes: int = DEFAULT_PAID_QUOTA_BYTES
+    free_retention: timedelta = DEFAULT_FREE_RETENTION
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -164,4 +172,9 @@ class Settings:
             stats_token=os.getenv("STATS_TOKEN", "").strip(),
             support_inbound_address=support_inbound_address,
             support_forward_address=support_forward_address,
+            free_quota_bytes=_positive_int("FREE_QUOTA_BYTES", DEFAULT_FREE_QUOTA_BYTES, maximum=2**63 - 1),
+            paid_quota_bytes=_positive_int("PAID_QUOTA_BYTES", DEFAULT_PAID_QUOTA_BYTES, maximum=2**63 - 1),
+            free_retention=timedelta(
+                days=_positive_int("FREE_RETENTION_DAYS", DEFAULT_FREE_RETENTION.days, maximum=36_500)
+            ),
         )

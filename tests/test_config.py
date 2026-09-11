@@ -10,6 +10,8 @@ reader to set must be enough for Settings.from_env() to succeed.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 
 from steepd.config import ConfigurationError, Settings
@@ -39,6 +41,9 @@ ALL_SETTINGS_ENV_VARS = (
     "SUPPORT_INBOUND_ADDRESS",
     "SUPPORT_FORWARD_ADDRESS",
     "STATS_TOKEN",
+    "FREE_QUOTA_BYTES",
+    "PAID_QUOTA_BYTES",
+    "FREE_RETENTION_DAYS",
 )
 
 
@@ -91,6 +96,70 @@ def test_mail_from_address_is_read_and_stripped(monkeypatch: pytest.MonkeyPatch)
 def _minimal_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PUBLIC_BASE_URL", "http://localhost:8000")
     monkeypatch.setenv("DATA_DIR", "./.localdata")
+
+
+def test_plan_defaults_preserve_the_existing_allowances(monkeypatch):
+    _minimal_env(monkeypatch)
+    settings = Settings.from_env()
+
+    assert settings.free_quota_bytes == 104857600
+    assert settings.paid_quota_bytes == 5368709120
+    assert settings.free_retention == timedelta(days=7)
+    assert Settings(data_dir=settings.data_dir, public_base_url=settings.public_base_url) == settings
+
+
+@pytest.mark.parametrize(
+    ("name", "field", "raw", "expected"),
+    [
+        ("FREE_QUOTA_BYTES", "free_quota_bytes", " 4096 ", 4096),
+        ("PAID_QUOTA_BYTES", "paid_quota_bytes", " 8192 ", 8192),
+        ("FREE_RETENTION_DAYS", "free_retention", " 60 ", timedelta(days=60)),
+        ("FREE_QUOTA_BYTES", "free_quota_bytes", "1", 1),
+        ("PAID_QUOTA_BYTES", "paid_quota_bytes", "1", 1),
+        ("FREE_RETENTION_DAYS", "free_retention", "1", timedelta(days=1)),
+        ("FREE_QUOTA_BYTES", "free_quota_bytes", str(2**63 - 1), 2**63 - 1),
+        ("PAID_QUOTA_BYTES", "paid_quota_bytes", str(2**63 - 1), 2**63 - 1),
+        ("FREE_RETENTION_DAYS", "free_retention", "36500", timedelta(days=36500)),
+    ],
+)
+def test_plan_limits_can_be_overridden_independently(monkeypatch, name, field, raw, expected):
+    _minimal_env(monkeypatch)
+    original = Settings.from_env()
+    monkeypatch.setenv(name, raw)
+    configured = Settings.from_env()
+
+    values = {
+        "free_quota_bytes": 104857600,
+        "paid_quota_bytes": 5368709120,
+        "free_retention": timedelta(days=7),
+    }
+    for attr, value in values.items():
+        assert getattr(original, attr) == value
+        assert getattr(configured, attr) == (expected if attr == field else value)
+    # Explicit construction stays independent of the changed environment, too.
+    assert Settings(data_dir=original.data_dir, public_base_url=original.public_base_url) == original
+
+
+@pytest.mark.parametrize("name", ["FREE_QUOTA_BYTES", "PAID_QUOTA_BYTES", "FREE_RETENTION_DAYS"])
+@pytest.mark.parametrize("raw", ["", " ", "no", "1.5", "0", "-1", "100MB", "7d"])
+def test_invalid_plan_limits_refuse_to_boot(monkeypatch, name, raw):
+    _minimal_env(monkeypatch)
+    monkeypatch.setenv(name, raw)
+
+    with pytest.raises(ConfigurationError, match=name):
+        Settings.from_env()
+
+
+@pytest.mark.parametrize(
+    ("name", "raw"),
+    [("FREE_QUOTA_BYTES", str(2**63)), ("PAID_QUOTA_BYTES", str(2**63)), ("FREE_RETENTION_DAYS", "36501")],
+)
+def test_excessive_plan_limits_refuse_to_boot(monkeypatch, name, raw):
+    _minimal_env(monkeypatch)
+    monkeypatch.setenv(name, raw)
+
+    with pytest.raises(ConfigurationError, match=name):
+        Settings.from_env()
 
 
 def test_the_public_page_links_default_to_empty(monkeypatch: pytest.MonkeyPatch) -> None:
