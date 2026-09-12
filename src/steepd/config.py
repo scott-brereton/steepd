@@ -6,6 +6,16 @@ from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
+# Runtime import is safe: plans.py only imports Settings under TYPE_CHECKING.
+from steepd.plans import KNOWN_PLANS
+from steepd.publication_ai import REASONING_MODES
+
+# What the enable form asks agreement to. Raise it only when the data-sharing
+# policy materially broadens: dispatch requires an account's recorded consent to be
+# at least this, so raising it stops everyone who agreed to the older wording until
+# they agree again, rather than carrying old consent onto something never shown.
+CONSENT_VERSION = 1
+
 DEFAULT_FREE_QUOTA_BYTES = 100 * 1024 * 1024
 DEFAULT_PAID_QUOTA_BYTES = 5 * 1024 * 1024 * 1024
 DEFAULT_FREE_RETENTION = timedelta(days=7)
@@ -32,6 +42,33 @@ def _positive_int(name: str, default: int, *, maximum: int | None = None) -> int
         suffix = f" no greater than {maximum}" if maximum is not None else ""
         raise ConfigurationError(f"{name} must be positive and{suffix}")
     return value
+
+
+def _name_tuple(variable: str) -> tuple[str, ...]:
+    """A comma-separated list of short names, e.g. a provider order."""
+    return tuple(part.strip() for part in os.getenv(variable, "").split(",") if part.strip())
+
+
+def _plan_tuple(variable: str) -> tuple[str, ...]:
+    """Which plans a feature is offered to. Unset means all of them.
+
+    An unrecognised plan name raises rather than being dropped: silently ignoring it
+    would turn a typo into "this feature is off for everybody", with nothing to say so.
+    """
+    names = _name_tuple(variable)
+    if not names:
+        return KNOWN_PLANS
+    unknown = [name for name in names if name not in KNOWN_PLANS]
+    if unknown:
+        raise ConfigurationError(f"{variable} lists unknown plans: {', '.join(sorted(unknown))}")
+    return names
+
+
+def _reasoning_mode(variable: str) -> str:
+    mode = os.getenv(variable, "").strip().lower() or "exclude"
+    if mode not in REASONING_MODES:
+        raise ConfigurationError(f"{variable} must be one of: {', '.join(sorted(REASONING_MODES))}")
+    return mode
 
 
 def _positive_float(name: str, default: float, *, maximum: float | None = None) -> float:
@@ -116,6 +153,31 @@ class Settings:
     free_quota_bytes: int = DEFAULT_FREE_QUOTA_BYTES
     paid_quota_bytes: int = DEFAULT_PAID_QUOTA_BYTES
     free_retention: timedelta = DEFAULT_FREE_RETENTION
+    # -- automatic newsletter organization --------------------------------
+    # Off unless the deployment says otherwise, and off for every account until its owner
+    # opts in: this flag is the service switch, not the account setting.
+    newsletter_ai_enabled: bool = False
+    # Named LLMKEY/LLMMODEL to match what the deployment already carries. The reader never
+    # supplies either; there is one operator-owned inference key, with its own spending
+    # limit set on the provider side, and no management key is deployed here at all.
+    newsletter_ai_key: str = ""
+    newsletter_ai_model: str = ""
+    newsletter_ai_providers: tuple[str, ...] = ()
+    # Which plans may use the feature. Both by default. An operator who wants to try it
+    # on paid accounts first sets NEWSLETTER_AI_PLANS=paid; an unknown name is refused
+    # rather than silently ignored, because a typo would otherwise disable the feature
+    # for everyone without saying so.
+    newsletter_ai_plans: tuple[str, ...] = KNOWN_PLANS
+    # An abuse and workload allowance, not a money budget: the provider-side limit on the
+    # key is the only dollar bound. See the plan's sizing note before changing it.
+    newsletter_ai_daily_limit: int = 200
+    newsletter_ai_max_input_price: float = 0.10
+    newsletter_ai_max_output_price: float = 0.40
+    # How much reasoning to pay for. "exclude" is the least an endpoint that mandates
+    # reasoning will do; "off" disables it outright where the endpoint allows that.
+    # Confirm against the chosen endpoint with ops/evaluate_publications.py smoke: some
+    # reject a request that tries to switch reasoning off, and reasoning is billed output.
+    newsletter_ai_reasoning: str = "exclude"
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -177,4 +239,13 @@ class Settings:
             free_retention=timedelta(
                 days=_positive_int("FREE_RETENTION_DAYS", DEFAULT_FREE_RETENTION.days, maximum=36_500)
             ),
+            newsletter_ai_enabled=os.getenv("NEWSLETTER_AI_ENABLED", "").strip().lower() in ("1", "true", "yes"),
+            newsletter_ai_key=os.getenv("LLMKEY", "").strip(),
+            newsletter_ai_model=os.getenv("LLMMODEL", "").strip(),
+            newsletter_ai_providers=_name_tuple("NEWSLETTER_AI_PROVIDERS"),
+            newsletter_ai_plans=_plan_tuple("NEWSLETTER_AI_PLANS"),
+            newsletter_ai_daily_limit=_positive_int("NEWSLETTER_AI_DAILY_LIMIT", 200, maximum=100_000),
+            newsletter_ai_max_input_price=_positive_float("NEWSLETTER_AI_MAX_INPUT_PRICE", 0.10, maximum=1_000.0),
+            newsletter_ai_max_output_price=_positive_float("NEWSLETTER_AI_MAX_OUTPUT_PRICE", 0.40, maximum=1_000.0),
+            newsletter_ai_reasoning=_reasoning_mode("NEWSLETTER_AI_REASONING"),
         )

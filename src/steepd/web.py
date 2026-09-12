@@ -21,17 +21,19 @@ which keeps the CSP's `style-src 'unsafe-inline'` the only concession it makes.
 import html
 import logging
 import math
+import re
 import secrets
 import sqlite3
+from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Annotated
-from urllib.parse import parse_qsl, urlencode, urljoin
+from typing import TYPE_CHECKING, Annotated
+from urllib.parse import parse_qsl, quote, urlencode, urljoin
 
 from bs4 import BeautifulSoup, NavigableString, Tag
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from starlette.concurrency import run_in_threadpool
 
@@ -46,7 +48,7 @@ from steepd.auth import (
     revoke_session,
     same_origin_guard,
 )
-from steepd.config import Settings
+from steepd.config import CONSENT_VERSION, Settings
 from steepd.db import AllowedSenderCapReached, Database
 from steepd.inboxnames import (
     email_stem,
@@ -54,11 +56,24 @@ from steepd.inboxnames import (
     normalize_inbox_local,
     validate_inbox_local_format,
 )
-from steepd.models import Item, RefusedSender, Tenant
+from steepd.models import (
+    Item,
+    OrganizationProgress,
+    Publication,
+    PublicationSummary,
+    RefusedSender,
+    SiteSummary,
+    Tenant,
+    UnorganizedIssue,
+)
 from steepd.outbound import OutboundEmailDisabled, OutboundEmailError, send_email
 from steepd.plans import FREE_PLAN, PAID_PLAN, quota_bytes, retention_for
+from steepd.publications import retention_cutoff
 from steepd.storage import ItemStorage
 from steepd.tenancy import TenantScope
+
+if TYPE_CHECKING:  # the worker is only a type here; the page reads its status by duck typing
+    from steepd.publications import Organizer
 
 LOGGER = logging.getLogger("steepd.web")
 
@@ -78,6 +93,18 @@ ACCOUNT_DEFAULT_SORT = ACCOUNT_SORTS[0]
 ACCOUNT_SORT_LABELS = {"newest": "Newest", "oldest": "Oldest", "title": "Title"}
 # The same cap the OPDS search route puts on its own q, because it is the same field.
 ACCOUNT_QUERY_MAX_LENGTH = 160
+
+# The four shelves a reader shows at the catalogue root, filtered exactly as the OPDS
+# feeds filter them: title, item kind, item source. None means no filter on that column.
+LIBRARY_SHELVES: dict[str, tuple[str, str | None, str | None]] = {
+    "recent": ("Recent", None, None),
+    "newsletters": ("Newsletters", "article", "newsletter"),
+    "saved": ("Saved", "article", "url"),
+    "books": ("Books", "book", None),
+}
+LIBRARY_DEFAULT_SHELF = "recent"
+# The site list on the Saved shelf is bounded rather than paged; past this it says so.
+LIBRARY_SITE_LIST_LIMIT = 500
 USAGE_WARNING_PERCENT = 85
 DELETE_CONFIRMATION_FIELD = "confirm"
 EMAIL_VERIFICATION_RELAY_DURATION = timedelta(minutes=5)
@@ -87,21 +114,46 @@ EMAIL_VERIFICATION_RELAY_DURATION = timedelta(minutes=5)
 # the item-delete route is absent only because its path carries an id and the middleware
 # matches exact paths.
 FORM_MAX_BYTES = 8 * 1024
+# The newsletter forms carry longer fields -- a 120-character name, a 500-character note,
+# or a page of selected item ids and their result tokens -- and every character can cost
+# twelve bytes once percent-encoded, so 620 characters of astral-plane text alone is
+# 7.4 KiB. Doubled rather than trimmed: field lengths are validated separately, and this
+# limit exists to stop an unauthenticated body being buffered, not to enforce them.
+NEWSLETTER_FORM_MAX_BYTES = 16 * 1024
 FORM_ROUTE_LIMITS = {
-    path: FORM_MAX_BYTES
-    for path in (
-        "/signup",
-        "/signin",
-        "/signout",
-        "/account/address",
-        "/account/rotate",
-        "/account/delete",
-        "/account/email-verification",
-        "/account/senders/policy",
-        "/account/senders/add",
-        "/account/senders/remove",
-    )
+    **{
+        path: FORM_MAX_BYTES
+        for path in (
+            "/signup",
+            "/signin",
+            "/signout",
+            "/account/address",
+            "/account/rotate",
+            "/account/delete",
+            "/account/email-verification",
+            "/account/senders/policy",
+            "/account/senders/add",
+            "/account/senders/remove",
+        )
+    },
+    # Every newsletter POST has a fixed path with the ids in the body, so the exact-path
+    # middleware in app.py covers them all. A route with an id in its path could not be
+    # registered here at all.
+    **{
+        path: NEWSLETTER_FORM_MAX_BYTES
+        for path in (
+            "/account/newsletters/settings",
+            "/account/newsletters/assign",
+            "/account/newsletters/publication",
+            "/account/newsletters/merge",
+            "/account/newsletters/retry",
+        )
+    },
 }
+
+MAX_PUBLICATION_NAME = 120
+MAX_IDENTIFICATION_NOTE = 500
+PUBLICATION_PAGE_SIZE = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +183,8 @@ class LibraryView:
     sort: str
     page: int
     pages: int
+    shelf: str
+    site: str
 
 
 # -- query parameters --------------------------------------------------------
@@ -149,6 +203,23 @@ def _clean_sort(raw: str) -> str:
     return raw if raw in ACCOUNT_SORTS else ACCOUNT_DEFAULT_SORT
 
 
+def _clean_shelf(raw: str) -> str:
+    return raw if raw in LIBRARY_SHELVES else LIBRARY_DEFAULT_SHELF
+
+
+# A site as the database computes it from a saved page's URL: a lowercase host, with a
+# port or IPv6 brackets when the URL had them. Anything else is not a site and is ignored.
+_SITE_HOST_PATTERN = re.compile(r"^(?=.*[a-z0-9])[a-z0-9.:\[\]-]{1,253}$")
+
+
+def is_site_host(raw: str) -> bool:
+    return bool(_SITE_HOST_PATTERN.match(raw)) and ".." not in raw
+
+
+def _clean_site(raw: str, *, shelf: str) -> str:
+    return raw if shelf == "saved" and is_site_host(raw) else ""
+
+
 def _clean_page(raw: str) -> int:
     try:
         page = int(raw)
@@ -157,21 +228,32 @@ def _clean_page(raw: str) -> int:
     return max(1, page)
 
 
-def _account_href(*, query: str = "", sort: str = ACCOUNT_DEFAULT_SORT, page: int = 1) -> str:
-    """An attribute-ready /account URL carrying only the parameters that are not defaults.
+def _library_href(
+    *,
+    shelf: str = LIBRARY_DEFAULT_SHELF,
+    site: str = "",
+    query: str = "",
+    sort: str = ACCOUNT_DEFAULT_SORT,
+    page: int = 1,
+) -> str:
+    """An attribute-ready /account/library URL carrying only the parameters that are not defaults.
 
     Escaped here rather than at each call site: the ampersands urlencode writes between
     parameters have to reach the browser as `&amp;`, and a link that skipped that would
     only misbehave once a page had two parameters on it, which is every paginated search.
     """
     params: list[tuple[str, str]] = []
+    if shelf != LIBRARY_DEFAULT_SHELF:
+        params.append(("shelf", shelf))
+    if site:
+        params.append(("site", site))
     if query:
         params.append(("q", query))
     if sort != ACCOUNT_DEFAULT_SORT:
         params.append(("sort", sort))
     if page > 1:
         params.append(("page", str(page)))
-    return html.escape(f"/account?{urlencode(params)}" if params else "/account", quote=True)
+    return html.escape(f"/account/library?{urlencode(params)}" if params else "/account/library", quote=True)
 
 
 # -- rendering ---------------------------------------------------------------
@@ -260,6 +342,8 @@ the step's :checked selector instead -- applying the animation fresh when a step
 what restarts it, including on "Start over". */
 .walk{margin:30px 0 0;padding:0}
 .walk-caption{font-size:14px;color:var(--muted);margin:0 0 12px}
+section summary{cursor:pointer;color:var(--muted);font-size:14px}
+section details{margin:12px 0}
 .walk details{background:var(--card);border:1px solid var(--rule);border-radius:12px}
 .walk summary{display:flex;align-items:center;gap:8px;cursor:pointer;list-style:none;padding:15px 20px;
 font:600 16px/1.2 ui-rounded,-apple-system,system-ui,sans-serif;color:var(--umber)}
@@ -636,12 +720,20 @@ def _search_form(view: LibraryView) -> str:
         if view.sort != ACCOUNT_DEFAULT_SORT
         else ""
     )
+    carried_shelf = (
+        f'<input type="hidden" name="shelf" value="{html.escape(view.shelf, quote=True)}">'
+        if view.shelf != LIBRARY_DEFAULT_SHELF
+        else ""
+    )
+    if view.site:
+        carried_shelf += f'<input type="hidden" name="site" value="{html.escape(view.site, quote=True)}">'
+
     return (
-        '<form method="get" action="/account"><div class="field">'
+        '<form method="get" action="/account/library"><div class="field">'
         '<input type="search" name="q" placeholder="Search titles and authors" '
         f'aria-label="Search your library" maxlength="{ACCOUNT_QUERY_MAX_LENGTH}" '
         f'value="{html.escape(view.query, quote=True)}">'
-        f'{carried_sort}<button type="submit">Search</button></div></form>'
+        f'{carried_shelf}{carried_sort}<button type="submit">Search</button></div></form>'
     )
 
 
@@ -654,7 +746,8 @@ def _sort_links(view: LibraryView) -> str:
         else:
             # No page: a reorder puts different items on page 3, so staying there would
             # land on a page of things the reader has never seen the start of.
-            choices.append(f'<a href="{_account_href(query=view.query, sort=sort)}">{label}</a>')
+            href = _library_href(shelf=view.shelf, site=view.site, query=view.query, sort=sort)
+            choices.append(f'<a href="{href}">{label}</a>')
     return f'<p class="fineprint">Sort: {" · ".join(choices)}</p>'
 
 
@@ -664,7 +757,7 @@ def _search_summary(view: LibraryView) -> str:
     matches = "1 item matches" if view.matching == 1 else f"{view.matching} items match"
     return (
         f'<p class="fineprint">{matches} “{html.escape(view.query)}”. '
-        f'<a href="{_account_href(sort=view.sort)}">Clear</a></p>'
+        f'<a href="{_library_href(shelf=view.shelf, site=view.site, sort=view.sort)}">Clear</a></p>'
     )
 
 
@@ -673,11 +766,11 @@ def _pager(view: LibraryView) -> str:
         return ""
     parts = []
     if view.page > 1:
-        href = _account_href(query=view.query, sort=view.sort, page=view.page - 1)
+        href = _library_href(shelf=view.shelf, site=view.site, query=view.query, sort=view.sort, page=view.page - 1)
         parts.append(f'<a href="{href}">Previous</a>')
     parts.append(f'<span class="meta">Page {view.page} of {view.pages}</span>')
     if view.page < view.pages:
-        href = _account_href(query=view.query, sort=view.sort, page=view.page + 1)
+        href = _library_href(shelf=view.shelf, site=view.site, query=view.query, sort=view.sort, page=view.page + 1)
         parts.append(f'<a href="{href}">Next</a>')
     return f'<p class="pager">{" ".join(parts)}</p>'
 
@@ -685,14 +778,77 @@ def _pager(view: LibraryView) -> str:
 def _library_section(view: LibraryView, *, retention: timedelta | None, now: datetime) -> str:
     if not view.library:
         return (
-            '<p class="lede">Nothing here yet. Send something to the address above and it will appear '
-            "in a minute or so.</p>"
+            '<p class="lede">Nothing here yet. Send something to your Steepd address and it will '
+            "appear in a minute or so.</p>"
         )
     controls = f"{_search_form(view)}{_sort_links(view)}{_search_summary(view)}"
     if not view.items:
         return f'{controls}<p class="lede">Nothing in your library matches that search.</p>'
     rows = "".join(_item_row(item, retention=retention, now=now) for item in view.items)
     return f'{controls}<ul class="items">{rows}</ul>{_pager(view)}'
+
+
+def _shelf_links(view: LibraryView) -> str:
+    """The shelves, one link each, with the current one in bold.
+
+    Inside a site the Saved shelf is a link again, back to the whole shelf: the site is
+    the only thing these links never carry.
+    """
+    parts = []
+    for shelf, (title, _, _) in LIBRARY_SHELVES.items():
+        if shelf == view.shelf and not view.site:
+            parts.append(f"<strong>{title}</strong>")
+        else:
+            parts.append(f'<a href="{_library_href(shelf=shelf)}">{title}</a>')
+    return f'<p class="fineprint">{" · ".join(parts)}</p>'
+
+
+def _site_links(sites: list[SiteSummary], *, total: int) -> str:
+    if not sites:
+        return ""
+    links = " · ".join(
+        f'<a href="{_library_href(shelf="saved", site=site.host)}">{html.escape(site.host)}</a> ({site.page_count})'
+        for site in sites
+    )
+    more = f" and {total - len(sites)} more" if total > len(sites) else ""
+    return f'<p class="fineprint sites">Sites: {links}{more}</p>'
+
+
+def _library_page(
+    view: LibraryView,
+    *,
+    retention: timedelta | None,
+    now: datetime,
+    sites: list[SiteSummary] = (),
+    site_total: int = 0,
+) -> HTMLResponse:
+    title, _, _ = LIBRARY_SHELVES[view.shelf]
+    heading = view.site or title
+    return _page(
+        f"Steepd — {heading.lower()}",
+        f"<h1>{html.escape(heading)}</h1>"
+        f"{_shelf_links(view)}"
+        f"{_site_links(list(sites), total=site_total)}"
+        f"{_library_section(view, retention=retention, now=now)}"
+        '<p class="fineprint"><a href="/account">Back to your account</a></p>',
+    )
+
+
+def _shelves_section(counts: dict[str, int]) -> str:
+    """The account page's library: one row per shelf with its count, as a reader shows it.
+
+    Newsletters links to the publications page rather than the flat list, because that is
+    where the grouping lives; the flat list is one link further on from there.
+    """
+    targets = {"newsletters": "/account/newsletters"}
+    rows = "".join(
+        "<li><div>"
+        f'<span class="title"><a href="{targets.get(shelf, _library_href(shelf=shelf))}">{title}</a></span>'
+        f'<span class="meta">{counts[shelf]} item{"s" if counts[shelf] != 1 else ""}</span>'
+        "</div></li>"
+        for shelf, (title, _, _) in LIBRARY_SHELVES.items()
+    )
+    return f'<section><h2>Your library</h2><ul class="items">{rows}</ul></section>'
 
 
 def _short_date(stamp: str) -> str:
@@ -785,8 +941,9 @@ def _email_verification_section(
 
 def _account_page(
     tenant: Tenant,
-    view: LibraryView,
+    counts: dict[str, int],
     *,
+    organization: str = "",
     settings: Settings,
     senders: list[str],
     refused: list[RefusedSender],
@@ -800,7 +957,6 @@ def _account_page(
 ) -> HTMLResponse:
     retention = retention_for(tenant.plan, settings=settings)
     allowance = quota_bytes(tenant.plan, settings=settings)
-    listing = _library_section(view, retention=retention, now=datetime.now(UTC))
     verification = _email_verification_section(
         tenant,
         relay_until=email_verification_until,
@@ -818,7 +974,8 @@ def _account_page(
         f'<div class="card"><span class="label">Device username</span>'
         f"<code>{html.escape(tenant.opds_username)}</code></div>"
         '<p class="fineprint"><a href="/devices">How to set this up on your reader</a></p>'
-        f"<section><h2>Your library</h2>{listing}</section>"
+        f"{organization}"
+        f"{_shelves_section(counts)}"
         f"{_senders_section(tenant, senders, refused)}"
         f"{verification}"
         "<section><h2>Device password</h2>"
@@ -1115,7 +1272,11 @@ def _landing_page(settings: Settings) -> HTMLResponse:
         "<section><h2>Newsletters and webpages that read like articles</h2>"
         '<p class="small">Steepd pulls the readable part from public webpages and flattens the nested '
         "tables in email newsletters. It keeps tables holding real data, drops tracking pixels, and "
-        "stores images in the file so everything works offline.</p></section>"
+        "stores images in the file so everything works offline.</p>"
+        '<p class="small">It can also group your newsletters by publication, so your reader shows '
+        "one shelf for each. This is off until you turn it on. When it is on, the text of each "
+        "newsletter is sent to a model provider to identify the publication, and you can correct "
+        "anything it gets wrong. Saved webpages are grouped by the site they came from.</p></section>"
         f"<section><h2>Pricing</h2>{_tiers(settings)}"
         '<p class="small muted">Paid plans arrive after the beta. Libraries built during the beta '
         "carry over.</p></section>"
@@ -1168,8 +1329,8 @@ def _privacy_page(settings: Settings) -> HTMLResponse:
     return _page(
         "Steepd — privacy",
         "<h1>Privacy</h1>"
-        '<p class="lede">Steepd holds your reading, so it holds as little else as it can and shows '
-        "none of it to anyone.</p>"
+        f'<p class="lede">Steepd holds your reading, so it holds as little else as it can. '
+        f"{_privacy_lede_tail(settings)}</p>"
         "<section><h2>What we hold</h2>"
         "<p>You sign up with an email address. It is used to send you sign-in links and, when you "
         "ask for it, to relay one temporary forwarding-verification email. It is not used for a "
@@ -1192,11 +1353,13 @@ def _privacy_page(settings: Settings) -> HTMLResponse:
         "arrives, and the stored file goes with the record of it. Deleting an item yourself deletes "
         "it straight away. Deleting your account deletes your library and your stored files, and "
         "your inbox address is held back so nobody else can ever be sent your mail.</p></section>"
+        f"{_privacy_organization_section(settings)}"
         "<section><h2>Who else is involved</h2>"
         "<p>Steepd runs on Railway, in the United States, and the email it sends you is delivered by "
         "Resend. Each sees only what its job needs: Railway holds the machine and its disk, Resend "
-        "handles the messages we send. Our logs record that a request happened, never what was in it "
-        "— no message content and no sign-in links.</p></section>"
+        f"handles the messages we send.{_privacy_third_party_tail(settings)} Our logs record that a "
+        "request happened, never what was in it — no message content, no sign-in links, and nothing "
+        "sent to or returned by a model.</p></section>"
         f"{questions}"
         f"{_footer(settings.source_repository_url)}",
     )
@@ -1646,7 +1809,386 @@ def suggest_inbox_local(email: str, database: Database) -> tuple[str, StemStatus
     return "", status
 
 
-def build_web_router(settings: Settings, database: Database, storage: ItemStorage) -> APIRouter:
+def _consent_copy(waiting: int, daily_limit: int) -> str:
+    """What turning this on actually does, in the words shown before it is turned on.
+
+    The count is stated because "organize my library" means something very different for
+    an account holding twelve issues and one holding four thousand, and a paid account
+    has no time-based retention to bound it. The allowance sentence appears only when it
+    is the thing that decides how long this takes.
+    """
+    scope = (
+        f"<p>This will organize <strong>{waiting} unprocessed newsletter"
+        f"{'s' if waiting != 1 else ''}</strong> currently in your library, "
+        "and each new one as it arrives.</p>"
+    )
+    if waiting > daily_limit:
+        scope += (
+            f'<p class="fineprint">Up to {daily_limit} are processed a day, so a library '
+            "this size will finish over several days. Your newsletters stay readable "
+            "throughout.</p>"
+        )
+    return (
+        "<p>Organize newsletters already in my library and new deliveries by publication.</p>"
+        f"{scope}"
+        # Folded by default so the account page stays short; a native details element
+        # opens without any script, and the summary says what is inside.
+        "<details><summary>What is sent, and to whom</summary>"
+        "<p>Steepd sends newsletter text and publication details to OpenRouter and its "
+        "model provider to identify publications. Text may contain personal information. "
+        "Your reader password and account credentials are never sent. You can turn this "
+        "off at any time.</p></details>"
+    )
+
+
+def _organization_setting(
+    *,
+    enabled: bool,
+    waiting: int,
+    daily_limit: int,
+    settings_revision: int,
+    available: bool,
+    consent_superseded: bool = False,
+) -> str:
+    revision = f'<input type="hidden" name="settings_revision" value="{settings_revision}">'
+    turn_off = (
+        '<form method="post" action="/account/newsletters/settings">'
+        f'{revision}<input type="hidden" name="enabled" value="no">'
+        '<button type="submit">Turn off</button></form>'
+    )
+    if not available:
+        # Nothing is sent from here, but an account that agreed earlier -- on another
+        # plan, or before the server was reconfigured -- must still be able to withdraw.
+        return (
+            "<p>Automatic organization is not available on this server at the moment. "
+            "Your newsletters are unaffected, and any publications you already have stay "
+            "browsable and editable.</p>"
+            f"{turn_off if enabled else ''}"
+        )
+    if consent_superseded:
+        # The setting is still on, but nothing is being sent: what the account agreed to
+        # no longer describes what this does. Saying "On" here would be a page reporting
+        # work that has silently stopped, with no way offered to start it again.
+        return (
+            '<p class="notice">Paused. What this does has changed since you turned it on, '
+            "so nothing is being sent until you read it again and confirm.</p>"
+            f"{_consent_copy(waiting, daily_limit)}"
+            '<form method="post" action="/account/newsletters/settings">'
+            f'{revision}<input type="hidden" name="enabled" value="yes">'
+            f'<input type="hidden" name="consent_version" value="{CONSENT_VERSION}">'
+            '<button type="submit">Turn on again</button></form>'
+            '<form method="post" action="/account/newsletters/settings">'
+            f'{revision}<input type="hidden" name="enabled" value="no">'
+            '<button type="submit">Leave it off</button></form>'
+        )
+    if enabled:
+        return (
+            "<p>On. This organizes the newsletters already in your library that have not been "
+            "processed, and each new one as it arrives.</p>"
+            f"{turn_off}"
+            '<p class="fineprint">Turning this off stops new analysis. Publications you '
+            "already have stay where they are, and you can still correct them.</p>"
+        )
+    return (
+        f"{_consent_copy(waiting, daily_limit)}"
+        '<form method="post" action="/account/newsletters/settings">'
+        f'{revision}<input type="hidden" name="enabled" value="yes">'
+        f'<input type="hidden" name="consent_version" value="{CONSENT_VERSION}">'
+        '<button type="submit">Turn on</button></form>'
+    )
+
+
+def _organization_progress(progress: OrganizationProgress, *, paused: str | None) -> str:
+    if progress.total == 0:
+        return ""
+    parts = [f"{progress.organized} organized"]
+    if progress.outstanding:
+        parts.append(f"{progress.outstanding} waiting")
+    if progress.unrecognized:
+        parts.append(f"{progress.unrecognized} not recognized")
+    if progress.failed:
+        parts.append(f"{progress.failed} could not be processed")
+    # Fixed words for a fixed set of conditions. Nothing a provider wrote is ever
+    # rendered here, so a reader sees an explanation rather than an error string.
+    explanation = {
+        "credit_exhausted": "Organizing is paused: this server has reached its monthly allowance.",
+        "auth_rejected": "Organizing is paused: this server needs attention from its operator.",
+        "daily_limit": "Today's processing allowance is used up. The rest continues tomorrow.",
+    }.get(paused or "", "Organizing is paused for now." if paused else "")
+    banner = f'<p class="notice">{html.escape(explanation)}</p>' if explanation else ""
+    return (
+        f"{banner}"
+        f'<p class="fineprint">{html.escape(" · ".join(parts))}. '
+        '<a href="/account">Refresh</a></p>'
+    )
+
+
+def _publication_shelf(summaries: list[PublicationSummary]) -> str:
+    if not summaries:
+        return ""
+    rows = "".join(
+        '<div class="item">'
+        f'<span class="title"><a href="/account/publications/{html.escape(s.publication.id, quote=True)}">'
+        f'{html.escape(s.publication.name)}</a></span>'
+        f'<span class="meta">{s.issue_count} issue{"s" if s.issue_count != 1 else ""}</span>'
+        "</div>"
+        for s in summaries
+    )
+    return f'<section class="card"><h2>Publications</h2><div class="items">{rows}</div></section>'
+
+
+def _empty_publications(publications: list[Publication], summaries: list[PublicationSummary]) -> str:
+    """Publications holding no retained issue, which the shelf above does not show.
+
+    They are still offered to the classifier and in every chooser, so a mistaken name
+    that was corrected away would otherwise linger with no page to rename or combine it
+    from. Listing them is the only way out that does not involve assigning an issue to
+    the wrong place on purpose.
+    """
+    listed = {summary.publication.id for summary in summaries}
+    empty = [publication for publication in publications if publication.id not in listed]
+    if not empty:
+        return ""
+    rows = "".join(
+        '<div class="item">'
+        f'<span class="title"><a href="/account/publications/{html.escape(p.id, quote=True)}">'
+        f"{html.escape(p.name)}</a></span>"
+        "</div>"
+        for p in empty
+    )
+    return (
+        '<section class="card"><h2>Empty publications</h2>'
+        '<p class="fineprint">No issues at the moment. These are still offered when new '
+        "issues arrive; open one to rename it or combine it into another.</p>"
+        f'<div class="items">{rows}</div></section>'
+    )
+
+
+def _publication_options(publications: list[Publication], *, selected: str = "") -> str:
+    """The chooser, with a distinguishing clue when two labels read the same.
+
+    Names are labels rather than identities, so two publications may legitimately share
+    one. Where that happens the original name is what tells them apart, and hiding it
+    would leave the reader picking blind between two identical rows.
+    """
+    seen = Counter(p.name.casefold() for p in publications)
+    options = ['<option value="">Keep ungrouped</option>']
+    for publication in publications:
+        label = publication.name
+        if seen[publication.name.casefold()] > 1:
+            clue = publication.original_name
+            if clue and clue != publication.name:
+                label = f"{label} ({clue})"
+        chosen = " selected" if publication.id == selected else ""
+        options.append(
+            f'<option value="{html.escape(publication.id, quote=True)}"{chosen}>{html.escape(label)}</option>'
+        )
+    return "".join(options)
+
+
+def _assign_form(item_id: str, publications: list[Publication], *, selected: str = "") -> str:
+    return (
+        '<form method="post" action="/account/newsletters/assign">'
+        f'<input type="hidden" name="item_id" value="{html.escape(item_id, quote=True)}">'
+        '<label class="label">Publication'
+        f'<select name="publication_id">{_publication_options(publications, selected=selected)}</select></label>'
+        '<label class="label">Or a new one'
+        f'<input type="text" name="new_name" maxlength="{MAX_PUBLICATION_NAME}" '
+        'autocomplete="off" placeholder="Publication name"></label>'
+        '<button type="submit">Save</button></form>'
+    )
+
+
+def _unorganized_list(
+    issues: list[UnorganizedIssue], publications: list[Publication], *, total: int = 0, page: int = 1
+) -> str:
+    if not issues:
+        return ""
+    # One form per issue so a correction is one action, plus one Retry form across the
+    # page. Each checkbox is keyed by its own item id and carries the result token it was
+    # rendered with as the value, so an unticked box is simply absent and a replayed form
+    # cannot restart a cycle that has since moved on.
+    explanations = {
+        "waiting": "waiting to be organized",
+        "running": "being organized now",
+        "retry": "being retried",
+        "unrecognized": "could not be identified",
+        "failed": "could not be processed",
+        "done": "not in a publication",
+    }
+    rows = []
+    retryable = []
+    for issue in issues:
+        state = explanations.get(issue.state, "not in a publication")
+        rows.append(
+            '<div class="item">'
+            f'<span class="title">{html.escape(issue.title)}</span>'
+            f'<span class="meta">{html.escape(state)}</span>'
+            f"{_assign_form(issue.item_id, publications)}"
+            "</div>"
+        )
+        if issue.result_token:
+            retryable.append(
+                '<label class="check"><input type="checkbox" '
+                f'name="item_{html.escape(issue.item_id, quote=True)}" '
+                f'value="{html.escape(issue.result_token, quote=True)}">'
+                f"{html.escape(issue.title)}</label>"
+            )
+    retry_form = ""
+    if retryable:
+        retry_form = (
+            '<form method="post" action="/account/newsletters/retry">'
+            f'{"".join(retryable)}<button type="submit">Try these again</button></form>'
+        )
+    pages = max(1, -(-total // PUBLICATION_PAGE_SIZE))
+    pager = ""
+    if pages > 1:
+        previous = f'<a href="/account/newsletters?page={page - 1}">Newer</a>' if page > 1 else ""
+        following = f'<a href="/account/newsletters?page={page + 1}">Older</a>' if page < pages else ""
+        pager = f'<p class="pager">{previous} {following}</p>'
+    return (
+        f'<section class="card"><h2>Not in a publication</h2><p class="fineprint">{total} issue'
+        f'{"s" if total != 1 else ""}.</p>'
+        f'<div class="items">{"".join(rows)}</div>{pager}{retry_form}</section>'
+    )
+
+
+def _publication_detail(
+    publication: Publication,
+    items: list[Item],
+    total: int,
+    page: int,
+    publications: list[Publication],
+) -> str:
+    # The chooser offers every publication, with this one preselected. The merge form
+    # offers the others, because combining a publication with itself is not a thing.
+    others = [other for other in publications if other.id != publication.id]
+    rows = "".join(
+        '<div class="item">'
+        f'<span class="title">{html.escape(item.title)}</span>'
+        f'<span class="meta">{html.escape(item.created_at[:10])}</span>'
+        # Correcting an issue that was filed correctly-ish is the common case, so the
+        # control belongs on the issue wherever it is shown -- not only where it failed.
+        f"{_assign_form(item.id, publications, selected=publication.id)}"
+        "</div>"
+        for item in items
+    )
+    issue_pages = max(1, -(-total // PUBLICATION_PAGE_SIZE))
+    pager = ""
+    if issue_pages > 1:
+        link = f"/account/publications/{html.escape(publication.id, quote=True)}"
+        previous = f'<a href="{link}?page={page - 1}">Newer</a>' if page > 1 else ""
+        following = f'<a href="{link}?page={page + 1}">Older</a>' if page < issue_pages else ""
+        pager = f'<p class="pager">{previous} {following}</p>'
+
+    merge = ""
+    if others:
+        choices = "".join(
+            f'<option value="{html.escape(other.id, quote=True)}">{html.escape(other.name)}</option>'
+            for other in others
+        )
+        merge = (
+            "<h3>Combine with another publication</h3>"
+            '<p class="fineprint">The issues move into the publication you keep. Links to '
+            "the one you combine keep working.</p>"
+            '<form method="post" action="/account/newsletters/merge">'
+            f'<input type="hidden" name="source_id" value="{html.escape(publication.id, quote=True)}">'
+            f'<label class="label">Move these issues into<select name="target_id">{choices}</select></label>'
+            '<button type="submit">Combine</button></form>'
+        )
+
+    return (
+        f"<h1>{html.escape(publication.name)}</h1>"
+        f'<p class="lede">{total} issue{"s" if total != 1 else ""} in your library.</p>'
+        f'<section class="card"><div class="items">{rows}</div>{pager}</section>'
+        '<section class="card"><h2>Publication settings</h2>'
+        '<form method="post" action="/account/newsletters/publication">'
+        f'<input type="hidden" name="publication_id" value="{html.escape(publication.id, quote=True)}">'
+        '<label class="label">Name'
+        f'<input type="text" name="name" maxlength="{MAX_PUBLICATION_NAME}" required '
+        f'value="{html.escape(publication.name, quote=True)}"></label>'
+        '<label class="label">Identification note (optional)'
+        f'<input type="text" name="identification_note" maxlength="{MAX_IDENTIFICATION_NOTE}" '
+        f'value="{html.escape(publication.identification_note, quote=True)}" '
+        'placeholder="The newsletter by Gergely Orosz, not the podcast"></label>'
+        '<button type="submit">Save</button></form>'
+        '<p class="fineprint">Renaming changes the label only. Issues stay where they are '
+        "and your reader's link to this publication keeps working.</p>"
+        f"{merge}</section>"
+        '<p class="fineprint"><a href="/account/newsletters">Back to newsletters</a></p>'
+    )
+
+
+def _privacy_lede_tail(settings: Settings) -> str:
+    """The sentence that has to change once anything can leave the server.
+
+    The old copy said Steepd shows none of your reading to anyone. That stops being true
+    the moment an account opts into classification, so the claim is narrowed to what is
+    still true for everyone and the exception is named rather than buried.
+    """
+    if not settings.newsletter_ai_enabled:
+        return "It shows none of it to anyone."
+    return (
+        "Nothing you read is shown to anyone unless you turn on newsletter organization, "
+        "which is off until you do."
+    )
+
+
+def _privacy_organization_section(settings: Settings) -> str:
+    """What opting in actually means, without claiming it is anonymous.
+
+    Newsletter text is not anonymous and this does not pretend otherwise: the honest
+    statement is what is removed, what remains, who processes it, and how to stop.
+    """
+    if not settings.newsletter_ai_enabled:
+        return ""
+    return (
+        "<section><h2>If you turn on newsletter organization</h2>"
+        "<p>This is off unless you turn it on, and it applies to newsletters only — never "
+        "to books or saved webpages. When it is on, each newsletter's readable text, its "
+        "title, byline and language, and the website its own view-online link points to, "
+        "are sent to OpenRouter and the model provider it routes to, so that the "
+        "publication can be identified. Your publications go with it: their names, any "
+        "earlier names from renaming or combining, any identification note you wrote, and "
+        "the title, byline and website of up to three issues you assigned by hand. "
+        "The request is routed to providers that agree not to retain or train on it, and "
+        "prompt logging is off on the key we use. Temporary processing and caching inside "
+        "a provider are still possible, so this is not a promise that no copy exists "
+        "anywhere for any length of time.</p>"
+        "<p>Before the text is sent, email addresses are removed and links are reduced to "
+        "the site name, dropping the per-reader tracking identifiers in their paths. The "
+        "article itself is sent as it is. Newsletter text can contain personal "
+        "information, and removing addresses does not make it anonymous. A very long "
+        "issue may be sent as its opening and its ending, marked as shortened; the copy in "
+        "your library is never shortened. Your reader password, your account credentials, "
+        "your email address and your account identifiers are never sent, and the model is "
+        "given no way to act on your account.</p>"
+        "<p>What is kept afterwards is small: the publication names you end up with, any "
+        "note you write to help identify one, and a record of which issue belongs to "
+        "which publication. A handful of your own corrections are read from the issues "
+        "themselves to guide later decisions, so they disappear when those issues do. "
+        "Turning the setting off stops all further analysis immediately; your existing "
+        "publications stay browsable and you can still correct them. Deleting your "
+        "account deletes all of it.</p></section>"
+    )
+
+
+def _privacy_third_party_tail(settings: Settings) -> str:
+    if not settings.newsletter_ai_enabled:
+        return ""
+    return (
+        " If you turn on newsletter organization, OpenRouter and the model provider it "
+        "routes your request to see the newsletter text and publication details described "
+        "above."
+    )
+
+
+def build_web_router(
+    settings: Settings,
+    database: Database,
+    storage: ItemStorage,
+    organizer: "Organizer | None" = None,
+) -> APIRouter:
     router = APIRouter()
     verify_same_origin = same_origin_guard(settings.public_base_url)
     # Secure would make the cookie undeliverable over plain HTTP, which is what a local
@@ -1718,15 +2260,20 @@ def build_web_router(settings: Settings, database: Database, storage: ItemStorag
     def _inbox_address(tenant: Tenant) -> str:
         return f"{tenant.inbox_local}@{settings.inbox_domain}" if settings.inbox_domain else tenant.inbox_local
 
-    def _library_view(scope: TenantScope, *, query: str, sort: str, page: int) -> LibraryView:
-        """One page of items, in the requested order, plus the counts the page links need.
+    def _library_view(
+        scope: TenantScope, *, shelf: str, site: str, query: str, sort: str, page: int
+    ) -> LibraryView:
+        """One page of one shelf, in the requested order, plus the counts the page links need.
 
-        A page number past the end is clamped to the last page rather than answered with an
-        empty list: it arrives from a bookmark taken when the library was larger, or from a
-        deletion that shortened it, and both read better as "you are on the last page".
+        Every count and the list share the shelf's filter, so an empty shelf in a full
+        library reads as empty rather than as a search that found nothing. A page number
+        past the end is clamped to the last page rather than answered with an empty list:
+        it arrives from a bookmark taken when the shelf was longer, or from a deletion that
+        shortened it, and both read better as "you are on the last page".
         """
-        matching = database.count_items(scope, query=query or None)
-        library = database.count_items(scope) if query else matching
+        _, kind, source = LIBRARY_SHELVES[shelf]
+        matching = database.count_items(scope, kind=kind, source=source, site=site or None, query=query or None)
+        library = database.count_items(scope, kind=kind, source=source, site=site or None) if query else matching
         pages = max(1, math.ceil(matching / ACCOUNT_PAGE_SIZE))
         page = min(page, pages)
 
@@ -1734,6 +2281,9 @@ def build_web_router(settings: Settings, database: Database, storage: ItemStorag
         # database does the ordering at any library size and this function only pages.
         items = database.list_items(
             scope,
+            kind=kind,
+            source=source,
+            site=site or None,
             query=query or None,
             limit=ACCOUNT_PAGE_SIZE,
             offset=(page - 1) * ACCOUNT_PAGE_SIZE,
@@ -1748,18 +2298,21 @@ def build_web_router(settings: Settings, database: Database, storage: ItemStorag
             sort=sort,
             page=page,
             pages=pages,
+            shelf=shelf,
+            site=site,
         )
 
     def _render_account(
         tenant: Tenant,
         *,
-        query: str = "",
-        sort: str = ACCOUNT_DEFAULT_SORT,
-        page: int = 1,
         error: str = "",
         status_code: int = status.HTTP_200_OK,
     ) -> HTMLResponse:
         scope = TenantScope(tenant.id)
+        counts = {
+            shelf: database.count_items(scope, kind=kind, source=source)
+            for shelf, (_, kind, source) in LIBRARY_SHELVES.items()
+        }
         verification_available = bool(
             settings.inbox_domain
             and settings.resend_api_key
@@ -1768,7 +2321,8 @@ def build_web_router(settings: Settings, database: Database, storage: ItemStorag
         )
         return _account_page(
             tenant,
-            _library_view(scope, query=query, sort=sort, page=page),
+            counts,
+            organization=_organization_card(tenant),
             settings=settings,
             senders=database.list_allowed_senders(tenant.id),
             refused=database.list_refused_senders(tenant.id),
@@ -1982,15 +2536,42 @@ def build_web_router(settings: Settings, database: Database, storage: ItemStorag
         return _redirect("/account")
 
     @router.get("/account")
-    def account(session: SignedIn, q: str = "", sort: str = "", page: str = "") -> Response:
+    def account(request: Request, session: SignedIn) -> Response:
+        # Links into the list may arrive here carrying q, sort and page. Presence, not
+        # value, decides: `?q=` is still a link into the list. The query goes across
+        # untouched for the library route to clean.
+        if any(name in request.query_params for name in ("q", "sort", "page")):
+            return _redirect(f"/account/library?{request.url.query}")
+        return _render_account(session.tenant)
+
+    @router.get("/account/library")
+    def library(
+        session: SignedIn, shelf: str = "", site: str = "", q: str = "", sort: str = "", page: str = ""
+    ) -> Response:
         # Taken as strings and validated by hand rather than declared as typed query
         # parameters: FastAPI would answer `page=nonsense` with a 422 JSON body, and a
-        # browser following a stale link deserves the library instead.
-        return _render_account(
-            session.tenant,
+        # browser following a stale link deserves the shelf instead.
+        scope = TenantScope(session.tenant.id)
+        chosen_shelf = _clean_shelf(shelf)
+        view = _library_view(
+            scope,
+            shelf=chosen_shelf,
+            site=_clean_site(site, shelf=chosen_shelf),
             query=_clean_query(q),
             sort=_clean_sort(sort),
             page=_clean_page(page),
+        )
+        sites: list[SiteSummary] = []
+        site_total = 0
+        if chosen_shelf == "saved" and not view.site:
+            sites = database.list_saved_sites(scope, limit=LIBRARY_SITE_LIST_LIMIT)
+            site_total = database.count_saved_sites(scope) if len(sites) == LIBRARY_SITE_LIST_LIMIT else len(sites)
+        return _library_page(
+            view,
+            retention=retention_for(session.tenant.plan, settings=settings),
+            now=datetime.now(UTC),
+            sites=sites,
+            site_total=site_total,
         )
 
     @router.post("/account/rotate", dependencies=[SameOrigin])
@@ -2093,7 +2674,283 @@ def build_web_router(settings: Settings, database: Database, storage: ItemStorag
         # the same outcome from where the user is standing, and reporting it would make
         # this route say whether an id exists.
         await run_in_threadpool(storage.delete, TenantScope(session.tenant.id), item_id)
+        return _redirect("/account/library")
+
+    # -- newsletters and publications --------------------------------------
+
+    def _retention_cutoff(tenant: Tenant) -> str | None:
+        return retention_cutoff(tenant.plan, settings, datetime.now(UTC))
+
+    def _organization_available(tenant: Tenant) -> bool:
+        # The organizer object always exists so the page can read its status; what makes
+        # the feature real is a configured classifier. Offering the setting without one
+        # collects consent for work that will never run.
+        return (
+            tenant.plan in settings.newsletter_ai_plans
+            and organizer is not None
+            and organizer.classifier is not None
+        )
+
+    def _organization_card(tenant: Tenant) -> str:
+        """The setting, the consent text and the progress line, for the account page."""
+        scope = TenantScope(tenant.id)
+        preferences = database.newsletter_preferences(scope)
+        progress = database.organization_progress(scope, retention_cutoff=_retention_cutoff(tenant))
+        # Agreed to an older description of what this does, so the worker will not send
+        # anything for this account until it is agreed again.
+        superseded = bool(preferences and preferences.enabled and preferences.consent_version < CONSENT_VERSION)
+        paused = organizer.status.paused_code if organizer is not None else None
+        # A server-wide pause needs the operator and outranks the daily allowance, or the
+        # page would promise that processing continues tomorrow when it will not.
+        if paused is None and preferences is not None:
+            if (
+                preferences.attempts_today >= settings.newsletter_ai_daily_limit
+                and preferences.attempt_day == datetime.now(UTC).date().isoformat()
+            ):
+                paused = "daily_limit"
+        setting = _organization_setting(
+            enabled=bool(preferences and preferences.enabled),
+            consent_superseded=superseded,
+            # Only what the worker will actually pick up: issues with no row, plus any
+            # left mid-cycle -- a claim released when the setting went off. Unrecognized,
+            # failed and Keep-ungrouped issues are never re-analyzed.
+            waiting=progress.outstanding,
+            daily_limit=settings.newsletter_ai_daily_limit,
+            settings_revision=preferences.settings_revision if preferences else 0,
+            available=_organization_available(tenant),
+        )
+        # A section like the others on this page, so it takes the same rule and spacing.
+        return (
+            "<section><h2>Organize my newsletters</h2>"
+            f"{setting}{_organization_progress(progress, paused=paused)}</section>"
+        )
+
+    def _render_newsletters(
+        tenant: Tenant, *, error: str = "", status_code: int = status.HTTP_200_OK, page: int = 1
+    ) -> Response:
+        scope = TenantScope(tenant.id)
+        cutoff = _retention_cutoff(tenant)
+        preferences = database.newsletter_preferences(scope)
+        publications = database.canonical_publications(scope)
+        # Every populated publication, not a page of them: the empty list below is the
+        # set difference, and a page-sized cut would call the fifty-first one empty.
+        summaries = database.list_publication_summaries(scope, limit=len(publications))
+        # "on" only when something is actually sent: an enabled account whose consent
+        # has been superseded, or that the server cannot serve, is paused, not on.
+        if not (preferences and preferences.enabled):
+            state = "off"
+        elif preferences.consent_version < CONSENT_VERSION or not _organization_available(tenant):
+            state = "paused"
+        else:
+            state = "on"
+        body = (
+            "<h1>Newsletters</h1>"
+            f"{_notice(error)}"
+            f'<p class="fineprint">Automatic organization is {state}. Change it on '
+            '<a href="/account">your account page</a>.</p>'
+            + _publication_shelf(summaries)
+            + _empty_publications(publications, summaries)
+            + _unorganized_list(
+                database.list_unorganized_newsletters(
+                    scope,
+                    retention_cutoff=cutoff,
+                    limit=PUBLICATION_PAGE_SIZE,
+                    offset=(page - 1) * PUBLICATION_PAGE_SIZE,
+                ),
+                publications,
+                total=database.count_unorganized_newsletters(scope, retention_cutoff=cutoff),
+                page=page,
+            )
+            + '<p class="fineprint"><a href="/account/library?shelf=newsletters">All newsletters</a>, '
+            "organized or not.</p>"
+            '<p class="fineprint"><a href="/account">Back to your account</a></p>'
+        )
+        return _page("Steepd — newsletters", body, status_code=status_code)
+
+    @router.get("/account/newsletters")
+    async def newsletters(session: SignedIn, page: Annotated[int, Query(ge=1)] = 1) -> Response:
+        return await run_in_threadpool(lambda: _render_newsletters(session.tenant, page=page))
+
+    @router.get("/account/publications/{publication_id}")
+    async def publication_page(
+        publication_id: str, session: SignedIn, page: Annotated[int, Query(ge=1)] = 1
+    ) -> Response:
+        def render() -> Response:
+            scope = TenantScope(session.tenant.id)
+            # A merged id resolves to its survivor, so a link followed from an old page
+            # opens the publication the issues actually live in now.
+            publication = database.resolve_publication(scope, publication_id)
+            if publication is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such publication")
+            filters = dict(kind="article", source="newsletter", publication=publication.id)
+            return _page(
+                f"Steepd — {publication.name}",
+                _publication_detail(
+                    publication,
+                    database.list_items(
+                        scope, **filters, limit=PUBLICATION_PAGE_SIZE,
+                        offset=(page - 1) * PUBLICATION_PAGE_SIZE,
+                    ),
+                    database.count_items(scope, **filters),
+                    page,
+                    database.canonical_publications(scope),
+                ),
+            )
+
+        return await run_in_threadpool(render)
+
+    @router.post("/account/newsletters/settings", dependencies=[SameOrigin])
+    async def newsletter_settings(request: Request, session: SignedIn) -> Response:
+        fields = await _form_fields(request)
+        enabled = fields.get("enabled") == "yes"
+        submitted = fields.get("settings_revision", "")
+        revision = int(submitted) if submitted.isdigit() else None
+        consented_to = fields.get("consent_version", "")
+        if enabled and not _organization_available(session.tenant):
+            return await run_in_threadpool(
+                _render_account,
+                session.tenant,
+                error="Automatic organization is not available here.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        if enabled and consented_to != str(CONSENT_VERSION):
+            # The page this was submitted from described a different arrangement. Recording
+            # the current version anyway would file agreement to wording nobody was shown.
+            return await run_in_threadpool(
+                _render_account,
+                session.tenant,
+                error="What this does has changed since that page was loaded. Please read it again.",
+                status_code=status.HTTP_409_CONFLICT,
+            )
+        def save() -> bool:
+            return database.set_newsletter_organization(
+                TenantScope(session.tenant.id),
+                enabled=enabled,
+                consent_version=CONSENT_VERSION,
+                settings_revision=revision,
+                now=datetime.now(UTC).isoformat(),
+            )
+
+        if not await run_in_threadpool(save):
+            # A form rendered before a later change: refusing is the point, because
+            # applying it would silently undo whatever happened in between.
+            return await run_in_threadpool(
+                _render_account,
+                session.tenant,
+                error="This page was out of date. Here it is again — please check the setting and try once more.",
+                status_code=status.HTTP_409_CONFLICT,
+            )
         return _redirect("/account")
+
+    @router.post("/account/newsletters/assign", dependencies=[SameOrigin])
+    async def assign_publication(request: Request, session: SignedIn) -> Response:
+        fields = await _form_fields(request)
+        item_id = fields.get("item_id", "").strip()
+        chosen = fields.get("publication_id", "").strip()
+        new_name = " ".join(fields.get("new_name", "").split())
+        if new_name and len(new_name) > MAX_PUBLICATION_NAME:
+            return await run_in_threadpool(
+                _render_newsletters,
+                session.tenant,
+                error=f"A publication name can be up to {MAX_PUBLICATION_NAME} characters.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+
+        def apply() -> bool:
+            scope = TenantScope(session.tenant.id)
+            now = datetime.now(UTC).isoformat()
+            if new_name:
+                # Replay handling, scoped to this one item: submitting the same form twice
+                # must not make a second publication, while two genuinely different
+                # publications stay free to share a display name.
+                if database.manual_assignment_matching(scope, item_id, new_name) is not None:
+                    return True
+                return (
+                    database.create_and_assign_for_owner(
+                        scope, item_id, publication_id=secrets.token_hex(8), name=new_name, now=now
+                    )
+                    is not None
+                )
+            return database.assign_publication_manually(
+                scope, item_id, publication_id=chosen or None, now=now
+            )
+
+        if not await run_in_threadpool(apply):
+            return await run_in_threadpool(
+                _render_newsletters,
+                session.tenant,
+                error="That newsletter or publication is no longer available. Here is the current list.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        return _redirect("/account/newsletters")
+
+    @router.post("/account/newsletters/publication", dependencies=[SameOrigin])
+    async def edit_publication(request: Request, session: SignedIn) -> Response:
+        fields = await _form_fields(request)
+        publication_id = fields.get("publication_id", "").strip()
+        name = " ".join(fields.get("name", "").split())
+        note = " ".join(fields.get("identification_note", "").split())
+        if not 1 <= len(name) <= MAX_PUBLICATION_NAME or len(note) > MAX_IDENTIFICATION_NOTE:
+            return await run_in_threadpool(
+                _render_newsletters,
+                session.tenant,
+                error=f"Give the publication a name of up to {MAX_PUBLICATION_NAME} characters.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        await run_in_threadpool(
+            database.edit_publication,
+            TenantScope(session.tenant.id),
+            publication_id,
+            name=name,
+            identification_note=note,
+            now=datetime.now(UTC).isoformat(),
+        )
+        return _redirect(f"/account/publications/{quote(publication_id, safe='')}")
+
+    @router.post("/account/newsletters/merge", dependencies=[SameOrigin])
+    async def merge_publications(request: Request, session: SignedIn) -> Response:
+        fields = await _form_fields(request)
+        source_id = fields.get("source_id", "").strip()
+        target_id = fields.get("target_id", "").strip()
+
+        def apply() -> bool:
+            return database.merge_publications(
+                TenantScope(session.tenant.id),
+                source_id=source_id,
+                target_id=target_id,
+                now=datetime.now(UTC).isoformat(),
+            )
+
+        if not await run_in_threadpool(apply):
+            # One of the two has been combined into something else since this page was
+            # drawn. Guessing which survivor was meant would move somebody's issues
+            # somewhere they never asked for.
+            return await run_in_threadpool(
+                _render_newsletters,
+                session.tenant,
+                error="One of those publications has changed. Here is the current list — please choose again.",
+                status_code=status.HTTP_409_CONFLICT,
+            )
+        return _redirect(f"/account/publications/{quote(target_id, safe='')}")
+
+    @router.post("/account/newsletters/retry", dependencies=[SameOrigin])
+    async def retry_newsletters(request: Request, session: SignedIn) -> Response:
+        fields = await _form_fields(request)
+        # Each checkbox is named for its item and valued with the result token it was
+        # rendered against, so unticked boxes are simply absent and a stale form matches
+        # nothing rather than restarting a newer cycle.
+        selections = [
+            (key.removeprefix("item_"), value)
+            for key, value in fields.items()
+            if key.startswith("item_") and value
+        ][:PUBLICATION_PAGE_SIZE]
+        await run_in_threadpool(
+            database.retry_organization_items,
+            TenantScope(session.tenant.id),
+            selections,
+            now=datetime.now(UTC).isoformat(),
+        )
+        return _redirect("/account/newsletters")
 
     @router.post("/signout", dependencies=[SameOrigin])
     async def signout(session: SignedInUnconfirmedOk) -> Response:
@@ -2119,6 +2976,12 @@ def build_web_router(settings: Settings, database: Database, storage: ItemStorag
             # every session, which is stronger than revoking this one -- deleting an
             # account has to sign out the other browsers too.
             scope = TenantScope(session.tenant.id)
+            # Before any of that, stop organization and advance the settings revision. A
+            # request already in flight then fails its commit guard, and a settings form
+            # open in another browser cannot re-enable the feature part-way through a
+            # deletion. If the file deletion below fails and the account survives, it
+            # stays paused rather than quietly resuming transmission.
+            database.pause_newsletter_organization(scope, now=datetime.now(UTC).isoformat())
             storage.delete_all_for_tenant(scope)
             database.delete_tenant(session.tenant.id)
 

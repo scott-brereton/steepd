@@ -57,16 +57,20 @@ def _navigation_entry(
     updated: str,
     href: str,
     description: str,
+    media_type: str = ACQUISITION_TYPE,
 ) -> None:
+    # media_type defaults to acquisition because every existing caller points at a list of
+    # books. An entry leading to another navigation feed -- Newsletters, once publications
+    # exist -- has to say so, or a reader treats the shelf it opens as a list of files.
     entry = _atom(root, "entry")
     _atom(entry, "id", entry_id)
     _atom(entry, "title", title)
     _atom(entry, "updated", updated)
     _atom(entry, "content", description, type="text")
-    _link(entry, rel="subsection", href=href, media_type=ACQUISITION_TYPE)
+    _link(entry, rel="subsection", href=href, media_type=media_type)
 
 
-def _publication_entry(root: ElementTree.Element, item: Item, base_url: str) -> None:
+def _acquisition_entry(root: ElementTree.Element, item: Item, base_url: str) -> None:
     entry = _atom(root, "entry")
     _atom(entry, "id", f"urn:sha256:{item.sha256}")
     _atom(entry, "title", item.title)
@@ -131,7 +135,11 @@ def _add_page_links(
 
 
 def build_root_catalog(database: Database, scope: TenantScope, base_url: str) -> bytes:
-    updated = database.latest_created_at(scope)
+    show_publications, catalogue_updated_at = database.newsletter_catalogue_state(scope)
+    # The newest arrival alone cannot express a rename, a merge, an expiry, or this feed's
+    # own Newsletters link changing target, so the catalogue clock is folded in. Both are
+    # ISO-8601 UTC strings written by this codebase, which order lexicographically.
+    updated = max(database.latest_created_at(scope), catalogue_updated_at or "")
     root = _feed("urn:steepd:root", "Steepd", updated)
     _add_common_links(root, base_url=base_url, self_path="/opds", self_type=NAVIGATION_TYPE)
     _navigation_entry(
@@ -142,21 +150,32 @@ def build_root_catalog(database: Database, scope: TenantScope, base_url: str) ->
         href=_absolute(base_url, "/opds/recent"),
         description="Everything recently added, newest first",
     )
+    # Once anything is saved, Saved opens a list of sites with All saved at the top; the
+    # flat feed keeps its address so an older bookmark still works. This switches back if
+    # every saved page goes, which is the honest shape of "nothing to group".
+    by_site = database.count_items(scope, kind="article", source="url") > 0
     _navigation_entry(
         root,
         entry_id="urn:steepd:saved",
         title="Saved",
         updated=updated,
-        href=_absolute(base_url, "/opds/saved"),
-        description="Webpages saved from a link in an email subject",
+        href=_absolute(base_url, "/opds/sites" if by_site else "/opds/saved"),
+        description="Webpages saved from a link in an email subject, by site" if by_site else
+        "Webpages saved from a link in an email subject",
+        media_type=NAVIGATION_TYPE if by_site else ACQUISITION_TYPE,
     )
     _navigation_entry(
         root,
         entry_id="urn:steepd:newsletters",
         title="Newsletters",
         updated=updated,
-        href=_absolute(base_url, "/opds/newsletters"),
-        description="Newsletters delivered to your inbox",
+        # /opds/newsletters stays exactly where it was, so a bookmark made before this
+        # feature keeps working; the root simply stops being the only way to reach it.
+        href=_absolute(base_url, "/opds/publications" if show_publications else "/opds/newsletters"),
+        description=(
+            "Your newsletters, by publication" if show_publications else "Newsletters delivered to your inbox"
+        ),
+        media_type=NAVIGATION_TYPE if show_publications else ACQUISITION_TYPE,
     )
     _navigation_entry(
         root,
@@ -180,21 +199,23 @@ def build_items_catalog(
     author: str | None = None,
     query: str | None = None,
     source: str | None = None,
+    publication: str | None = None,
+    site: str | None = None,
     page: int = 1,
+    self_path: str | None = None,
+    updated_floor: str | None = None,
 ) -> bytes:
-    self_path = f"/opds/{feed_id}"
+    # self_path is overridable so a feed reached through a merged publication's old URL
+    # advertises the URL that was actually requested. Answering there directly is what
+    # lets an old bookmark keep working without relying on the reader to follow a redirect.
+    self_path = self_path or f"/opds/{feed_id}"
     offset = (page - 1) * PAGE_SIZE
-    total = database.count_items(scope, kind=kind, author=author, query=query, source=source)
-    items = database.list_items(
-        scope,
-        kind=kind,
-        author=author,
-        query=query,
-        source=source,
-        limit=PAGE_SIZE,
-        offset=offset,
-    )
+    filters = dict(kind=kind, author=author, query=query, source=source, publication=publication, site=site)
+    total = database.count_items(scope, **filters)
+    items = database.list_items(scope, **filters, limit=PAGE_SIZE, offset=offset)
     updated = items[0].created_at if items else database.latest_created_at(scope)
+    # A rename moves a publication's feed without changing any issue's arrival date.
+    updated = max(updated, updated_floor or "")
     root = _feed(f"urn:steepd:catalog:{feed_id}", title, updated)
     _add_common_links(root, base_url=base_url, self_path=self_path, self_type=ACQUISITION_TYPE)
     page_query: dict[str, object] = {}
@@ -209,7 +230,7 @@ def build_items_catalog(
         extra_query=page_query,
     )
     for item in items:
-        _publication_entry(root, item, base_url)
+        _acquisition_entry(root, item, base_url)
     return _serialize(root)
 
 
@@ -264,3 +285,128 @@ def build_authors_catalog(database: Database, scope: TenantScope, base_url: str,
     for author in authors:
         _author_entry(root, author, base_url)
     return _serialize(root)
+
+
+def build_publications_catalog(database: Database, scope: TenantScope, base_url: str, *, page: int = 1) -> bytes:
+    """The navigation feed listing All newsletters and each publication.
+
+    PAGE_SIZE is reused unchanged. All newsletters is an extra entry rather than one of
+    the fifty, so a page carries 51 -- inside the 62 a CrossPoint retains -- and the page
+    arithmetic in _add_page_links keeps counting the thing it was written to count. It
+    appears on every page so the shortcut is never more than one tap away.
+    """
+    _, catalogue_updated_at = database.newsletter_catalogue_state(scope)
+    updated = max(database.latest_created_at(scope), catalogue_updated_at or "")
+    total = database.count_publications(scope)
+    summaries = database.list_publication_summaries(scope, limit=PAGE_SIZE, offset=(page - 1) * PAGE_SIZE)
+
+    root = _feed("urn:steepd:publications", "Newsletters", updated)
+    _add_common_links(root, base_url=base_url, self_path="/opds/publications", self_type=NAVIGATION_TYPE)
+    _add_page_links(
+        root,
+        base_url=base_url,
+        path="/opds/publications",
+        page=page,
+        total=total,
+        media_type=NAVIGATION_TYPE,
+    )
+    _navigation_entry(
+        root,
+        entry_id="urn:steepd:newsletters",
+        title="All newsletters",
+        updated=updated,
+        href=_absolute(base_url, "/opds/newsletters"),
+        description="Every newsletter, newest first",
+    )
+    for summary in summaries:
+        publication = summary.publication
+        _navigation_entry(
+            root,
+            entry_id=f"urn:steepd:publication:{publication.id}",
+            title=publication.name,
+            updated=publication.updated_at,
+            href=_absolute(base_url, f"/opds/publications/{publication.id}"),
+            description=f"{summary.issue_count} issue{'s' if summary.issue_count != 1 else ''}",
+        )
+    return _serialize(root)
+
+
+def build_publication_catalog(
+    database: Database, scope: TenantScope, base_url: str, *, publication_id: str, page: int = 1
+) -> bytes | None:
+    """One publication's issues, or None when this tenant has no such publication.
+
+    A merged id resolves to its survivor and the survivor's issues are returned at the
+    requested URL. Renames never move this URL: it carries the publication's id, and a
+    rename leaves that alone.
+    """
+    publication = database.resolve_publication(scope, publication_id)
+    if publication is None:
+        return None
+    return build_items_catalog(
+        database,
+        scope,
+        base_url,
+        title=publication.name,
+        feed_id=f"publication:{publication.id}",
+        kind="article",
+        source="newsletter",
+        publication=publication.id,
+        page=page,
+        self_path=f"/opds/publications/{publication_id}",
+        updated_floor=publication.updated_at,
+    )
+
+
+def build_sites_catalog(database: Database, scope: TenantScope, base_url: str, *, page: int = 1) -> bytes:
+    """The navigation feed listing All saved and then one entry per site.
+
+    Shaped like the publications feed: PAGE_SIZE sites plus the All saved entry on every
+    page. `updated` is the newest saved page, which is the same clock the flat feed uses;
+    deleting an older page changes a count without moving it. A reader opens the feed on
+    demand rather than polling it, so that is accepted rather than tracked in a new column.
+    """
+    updated = database.latest_created_at(scope)
+    total = database.count_saved_sites(scope)
+    sites = database.list_saved_sites(scope, limit=PAGE_SIZE, offset=(page - 1) * PAGE_SIZE)
+
+    root = _feed("urn:steepd:sites", "Saved", updated)
+    _add_common_links(root, base_url=base_url, self_path="/opds/sites", self_type=NAVIGATION_TYPE)
+    _add_page_links(root, base_url=base_url, path="/opds/sites", page=page, total=total, media_type=NAVIGATION_TYPE)
+    _navigation_entry(
+        root,
+        entry_id="urn:steepd:saved",
+        title="All saved",
+        updated=updated,
+        href=_absolute(base_url, "/opds/saved"),
+        description="Every saved page, newest first",
+    )
+    for site in sites:
+        _navigation_entry(
+            root,
+            entry_id=f"urn:steepd:site:{site.host}",
+            title=site.host,
+            updated=site.updated_at,
+            href=_absolute(base_url, f"/opds/sites/{quote(site.host, safe='')}"),
+            description=f"{site.page_count} page{'s' if site.page_count != 1 else ''}",
+        )
+    return _serialize(root)
+
+
+def build_site_catalog(database: Database, scope: TenantScope, base_url: str, *, host: str, page: int = 1) -> bytes:
+    """One site's saved pages. A host with none gives an empty feed, as an author does.
+
+    An empty feed rather than a 404 keeps a bookmark usable after the last page from that
+    site expires, and answers the same for a host nobody here ever saved from.
+    """
+    return build_items_catalog(
+        database,
+        scope,
+        base_url,
+        title=host,
+        feed_id=f"sites/{quote(host, safe='')}",
+        kind="article",
+        source="url",
+        site=host,
+        page=page,
+    )

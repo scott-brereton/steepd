@@ -3,7 +3,7 @@ from __future__ import annotations
 import secrets
 import sqlite3
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,7 +12,21 @@ from typing import Any
 from steepd import words
 from steepd.auth import hash_password
 from steepd.inboxnames import is_placeholder, normalize_inbox_local, placeholder_inbox_local
-from steepd.models import AuthorSummary, Item, RefusedSender, Tenant
+from steepd.models import (
+    AuthorSummary,
+    ClaimedOrganization,
+    Item,
+    NewsletterPreferences,
+    OrganizationCandidate,
+    OrganizationGuard,
+    OrganizationProgress,
+    Publication,
+    PublicationSummary,
+    RefusedSender,
+    SiteSummary,
+    Tenant,
+    UnorganizedIssue,
+)
 from steepd.plans import KNOWN_PLANS
 from steepd.tenancy import TenantScope
 
@@ -152,10 +166,109 @@ CREATE TABLE IF NOT EXISTS retired_inbox_locals (
     retired_at  TEXT NOT NULL
 );
 
-PRAGMA user_version = 6;
+-- Whether a tenant has opted into automatic newsletter organization, plus the small
+-- amount of coordination state the worker needs. An absent row means disabled, so a GET
+-- that merely renders the account page can never opt anybody in.
+CREATE TABLE IF NOT EXISTS newsletter_preferences (
+    tenant_id TEXT PRIMARY KEY REFERENCES tenants(id) ON DELETE CASCADE,
+    enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+    consent_version INTEGER NOT NULL DEFAULT 0,
+    consented_at TEXT,
+    -- Bumped whenever consent or the enabled flag changes. A worker captures this before
+    -- it spends and re-checks it when it commits, so an answer produced for a setting the
+    -- owner has since withdrawn cannot be applied -- including an Off/On race.
+    -- Starts at 0 so the very first settings form, rendered before any row exists,
+    -- submits a revision that matches. Starting at 1 made every first enable a
+    -- conflict, which is to say the feature could never be switched on at all.
+    settings_revision INTEGER NOT NULL DEFAULT 0,
+    -- Bumped whenever the publication choices a classifier was shown change: a create,
+    -- rename, merge or manual assignment. Without it two overlapping first issues would
+    -- both answer "new" against the same empty catalogue and create duplicate records.
+    catalogue_revision INTEGER NOT NULL DEFAULT 1,
+    catalogue_updated_at TEXT,
+    -- Round-robin marker: the least recently served enabled tenant is chosen first, so one
+    -- account's backlog cannot hold up another account's new delivery.
+    last_served_at TEXT,
+    attempt_day TEXT,
+    attempts_today INTEGER NOT NULL DEFAULT 0
+);
+
+-- A publication is the label issues are grouped under; its feed is a query for those
+-- issues, not a second collection with copied memberships. Names are labels and never
+-- identities: two publications may legitimately share a display name, and nothing merges
+-- records because names or domains look alike. Only the owner combines them.
+CREATE TABLE IF NOT EXISTS publications (
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    id TEXT NOT NULL,
+    name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 120),
+    -- The name at creation, kept as an identification clue after a rename. A rename is a
+    -- display change, not an instruction to stop recognising the publication it names.
+    original_name TEXT NOT NULL CHECK (length(original_name) BETWEEN 1 AND 120),
+    identification_note TEXT NOT NULL DEFAULT '' CHECK (length(identification_note) <= 500),
+    -- Set when this record was combined into another. Merged rows are kept rather than
+    -- deleted: their names and notes stay as clues for the survivor, and their old OPDS
+    -- URLs keep resolving. Redirects stay one hop -- merging a survivor repoints the
+    -- aliases already pointing at it, so resolution never walks a chain.
+    merged_into_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, id),
+    FOREIGN KEY (tenant_id, merged_into_id) REFERENCES publications(tenant_id, id),
+    CHECK (merged_into_id IS NULL OR merged_into_id <> id)
+);
+
+-- One row per newsletter item the worker has touched. THE ABSENCE OF A ROW IS THE WAITING
+-- STATE: a retained newsletter with no row here is work still to do. That is why
+-- insert_item() is untouched by this feature -- there is nothing to enqueue at import --
+-- why enabling needs no bulk scheduling pass, and why re-enabling naturally picks up the
+-- deliveries that arrived while the setting was off.
+CREATE TABLE IF NOT EXISTS newsletter_organization (
+    tenant_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    publication_id TEXT,
+    state TEXT NOT NULL CHECK (state IN ('running', 'retry', 'done', 'unrecognized', 'failed')),
+    -- Protects an owner's decision, including Keep ungrouped, from every worker write.
+    manual INTEGER NOT NULL DEFAULT 0 CHECK (manual IN (0, 1)),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    -- Also the result token a Retry form submits. It identifies which result is being
+    -- retried; it is not a credential, and it is not a way to commit work over HTTP.
+    -- Every claim replaces it, so a stale form cannot restart a newer cycle.
+    lease_token TEXT,
+    -- One column, two mutually exclusive meanings that `state` names: the lease expiry
+    -- while running, and the next eligible time while retrying. Always NULL once terminal,
+    -- so a finished row can never be selected as due work.
+    not_before TEXT,
+    error_code TEXT,
+    PRIMARY KEY (tenant_id, item_id),
+    FOREIGN KEY (tenant_id, item_id) REFERENCES items(tenant_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (tenant_id, publication_id) REFERENCES publications(tenant_id, id),
+    CHECK (CASE WHEN state IN ('running', 'retry') THEN not_before IS NOT NULL ELSE not_before IS NULL END),
+    CHECK (state <> 'running' OR lease_token IS NOT NULL),
+    -- An assignment exists only on a finished row, and a finished row without one is the
+    -- owner's explicit Keep ungrouped. A model answering "cannot identify" is
+    -- 'unrecognized', which is a successful answer; 'failed' is an operational failure.
+    CHECK (publication_id IS NULL OR state = 'done'),
+    CHECK (state <> 'done' OR publication_id IS NOT NULL OR manual = 1),
+    CHECK (manual = 0 OR state = 'done'),
+    CHECK (error_code IS NULL OR state IN ('retry', 'failed'))
+);
+
+-- Parent key for the two composite foreign keys above. SQLite enforces a composite FK
+-- only when the referenced columns carry a unique index; items(id) alone is not one.
+CREATE UNIQUE INDEX IF NOT EXISTS items_tenant_id_idx ON items(tenant_id, id);
+CREATE INDEX IF NOT EXISTS newsletter_organization_publication_idx
+    ON newsletter_organization(tenant_id, publication_id, item_id);
+-- Due work: expired leases and retries that have come due. Partial, because terminal rows
+-- hold NULL here and are exactly the rows this index must never have to skip.
+CREATE INDEX IF NOT EXISTS newsletter_organization_due_idx
+    ON newsletter_organization(tenant_id, not_before) WHERE not_before IS NOT NULL;
+CREATE INDEX IF NOT EXISTS publications_name_idx
+    ON publications(tenant_id, name COLLATE NOCASE, id);
+
+PRAGMA user_version = 7;
 """
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # Columns cannot be added by CREATE TABLE IF NOT EXISTS, so a database already carrying
 # tenants gets them by hand. Every existing account keeps its name and counts as
@@ -184,8 +297,34 @@ MAX_REFUSED_SENDERS = 20
 SENDER_POLICIES = ("anyone", "listed")
 
 
+# The site a saved page came from, computed from its stored URL: everything after the
+# scheme up to the first "/", "?" or "#", lowercased, without a leading "www.". A URL with
+# no scheme gives "". One expression, used for grouping and for filtering alike, so a
+# count and the list it introduces always agree. Ports stay: they are part of the origin.
+_SITE_AFTER_SCHEME = (
+    "CASE WHEN instr(source_url, '://') > 0 THEN substr(source_url, instr(source_url, '://') + 3) ELSE '' END"
+)
+_SITE_HOST = (
+    f"lower(substr(({_SITE_AFTER_SCHEME}), 1, min("
+    f"instr(({_SITE_AFTER_SCHEME}) || '/', '/'), "
+    f"instr(({_SITE_AFTER_SCHEME}) || '?', '?'), "
+    f"instr(({_SITE_AFTER_SCHEME}) || '#', '#')) - 1))"
+)
+SITE_SQL = f"CASE WHEN ({_SITE_HOST}) LIKE 'www.%' THEN substr(({_SITE_HOST}), 5) ELSE ({_SITE_HOST}) END"
+
+
 class AllowedSenderCapReached(ValueError):
     pass
+
+
+class DatabaseTooNew(RuntimeError):
+    """The file on disk was written by a later version of Steepd.
+
+    Running an older binary against a newer schema is the one case initialize() must
+    refuse rather than repair: CREATE TABLE IF NOT EXISTS would silently skip tables it
+    does not know about, and the service would then read and write a shape it half
+    understands. A rolled-back deployment should fail loudly and stay off.
+    """
 
 
 class Database:
@@ -196,10 +335,23 @@ class Database:
     def initialize(self) -> None:
         """Create or upgrade the schema. A fresh database reads version 0, skips the
         migration and gets the current CREATEs; a v5 database gains the relay table
-        through CREATE TABLE IF NOT EXISTS, without rewriting the tenants table."""
+        through CREATE TABLE IF NOT EXISTS, without rewriting the tenants table; a v6
+        database gains the three newsletter-organization tables the same way.
+
+        6 -> 7 needs no migration branch because it adds only tables and indexes, which
+        CREATE ... IF NOT EXISTS expresses idempotently. executescript commits each
+        statement on its own, so an interrupted run leaves some tables present and
+        user_version behind -- and the next start finishes the job rather than having to
+        undo it. That is why the version write is the last statement in SCHEMA.
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._write_lock, self._session() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version > SCHEMA_VERSION:
+                raise DatabaseTooNew(
+                    f"Database schema version {version} is newer than this application "
+                    f"supports ({SCHEMA_VERSION}); refusing to start"
+                )
             if version == 4:
                 connection.executescript(_MIGRATE_4_TO_5)
             connection.executescript(SCHEMA)
@@ -785,6 +937,8 @@ class Database:
         author: str | None,
         query: str | None,
         source: str | None,
+        publication: str | None = None,
+        site: str | None = None,
     ) -> tuple[str, list[Any]]:
         clauses = ["tenant_id = ?"]
         params: list[Any] = [scope.tenant_id]
@@ -804,6 +958,19 @@ class Database:
         if query:
             clauses.append("(title LIKE ? COLLATE NOCASE OR author LIKE ? COLLATE NOCASE)")
             params.extend([f"%{query}%", f"%{query}%"])
+        if publication is not None:
+            # A publication's feed is a query for its issues, not a second collection: the
+            # membership lives in newsletter_organization and is read through EXISTS so
+            # every existing ordering, page and count path keeps working untouched.
+            clauses.append(
+                "EXISTS (SELECT 1 FROM newsletter_organization o"
+                " WHERE o.tenant_id = items.tenant_id AND o.item_id = items.id"
+                " AND o.publication_id = ?)"
+            )
+            params.append(publication)
+        if site is not None:
+            clauses.append(f"({SITE_SQL}) = ?")
+            params.append(site)
         return " AND ".join(clauses), params
 
     # Fixed ORDER BY clauses keyed by name. The clause is interpolated into SQL, so it must
@@ -823,11 +990,15 @@ class Database:
         author: str | None = None,
         query: str | None = None,
         source: str | None = None,
+        publication: str | None = None,
+        site: str | None = None,
         limit: int = 50,
         offset: int = 0,
         order: str = "newest",
     ) -> list[Item]:
-        where, params = self._item_filters(scope, kind=kind, author=author, query=query, source=source)
+        where, params = self._item_filters(
+            scope, kind=kind, author=author, query=query, source=source, publication=publication, site=site
+        )
         ordering = self._ITEM_ORDERINGS[order]
         sql = f"SELECT * FROM items WHERE {where} ORDER BY {ordering} LIMIT ? OFFSET ?"
         with self._session() as connection:
@@ -852,8 +1023,12 @@ class Database:
         author: str | None = None,
         query: str | None = None,
         source: str | None = None,
+        publication: str | None = None,
+        site: str | None = None,
     ) -> int:
-        where, params = self._item_filters(scope, kind=kind, author=author, query=query, source=source)
+        where, params = self._item_filters(
+            scope, kind=kind, author=author, query=query, source=source, publication=publication, site=site
+        )
         with self._session() as connection:
             row = connection.execute(f"SELECT COUNT(*) FROM items WHERE {where}", params).fetchone()
         return int(row[0])
@@ -887,6 +1062,35 @@ class Database:
             ).fetchone()
         return int(row[0])
 
+    _SAVED_SITES = f"""
+        SELECT {SITE_SQL} AS site, COUNT(*) AS page_count, MAX(created_at) AS updated_at
+          FROM items
+         WHERE tenant_id = ? AND kind = 'article' AND source = 'url'
+      GROUP BY site
+        HAVING site <> ''
+    """
+
+    def list_saved_sites(self, scope: TenantScope, *, limit: int = 50, offset: int = 0) -> list[SiteSummary]:
+        """The sites saved pages came from, alphabetically, with counts.
+
+        Grouped by the same expression the site filter uses, so a shelf never advertises a
+        number its list then fails to deliver. A page whose URL has no scheme has no site
+        and is left out here; it still appears in the flat Saved list.
+        """
+        with self._session() as connection:
+            rows = connection.execute(
+                f"{self._SAVED_SITES} ORDER BY site ASC LIMIT ? OFFSET ?", (scope.tenant_id, limit, offset)
+            ).fetchall()
+        return [
+            SiteSummary(host=row["site"], page_count=int(row["page_count"]), updated_at=row["updated_at"])
+            for row in rows
+        ]
+
+    def count_saved_sites(self, scope: TenantScope) -> int:
+        with self._session() as connection:
+            row = connection.execute(f"SELECT COUNT(*) FROM ({self._SAVED_SITES})", (scope.tenant_id,)).fetchone()
+        return int(row[0])
+
     def latest_created_at(self, scope: TenantScope) -> str:
         with self._session() as connection:
             row = connection.execute(
@@ -905,8 +1109,16 @@ class Database:
             ).fetchone()
         return int(row[0] or 0)
 
-    def delete_item(self, scope: TenantScope, item_id: str) -> bool:
+    def delete_item(self, scope: TenantScope, item_id: str, *, now: str | None = None) -> bool:
+        now = now or datetime.now(UTC).isoformat()
         with self._write_lock, self._session() as connection:
+            organized = connection.execute(
+                """
+                SELECT publication_id FROM newsletter_organization
+                 WHERE tenant_id = ? AND item_id = ? AND publication_id IS NOT NULL
+                """,
+                (scope.tenant_id, item_id),
+            ).fetchone()
             cursor = connection.execute(
                 "DELETE FROM items WHERE tenant_id = ? AND id = ?", (scope.tenant_id, item_id)
             )
@@ -919,6 +1131,17 @@ class Database:
                     "DELETE FROM newsletter_deliveries WHERE tenant_id = ? AND item_id = ?",
                     (scope.tenant_id, item_id),
                 )
+                if organized is not None:
+                    # Read before the DELETE, because the organization row goes with the
+                    # item through ON DELETE CASCADE. Without this the navigation feed
+                    # would keep advertising a publication whose last issue just expired:
+                    # the newest surviving item's date cannot express a removal, and after
+                    # an expiry it can even move backwards.
+                    connection.execute(
+                        "UPDATE publications SET updated_at = ? WHERE tenant_id = ? AND id = ?",
+                        (now, scope.tenant_id, organized["publication_id"]),
+                    )
+                self._touch_catalogue(connection, scope.tenant_id, now)
         return cursor.rowcount == 1
 
     # -- operator stats ------------------------------------------------------
@@ -1101,3 +1324,1129 @@ class Database:
                 ),
             )
             return cursor.rowcount == 1
+
+    # -- newsletter organization -------------------------------------------
+    # Three tables behind one setting. The shape to hold on to: THE ABSENCE OF A
+    # newsletter_organization ROW IS THE WAITING STATE. Nothing is enqueued at import,
+    # nothing is scheduled when the setting is turned on, and re-enabling therefore picks
+    # up the deliveries that arrived while it was off without a catch-up pass.
+    #
+    # Every decision below is a conditional write in the idiom redeem_magic_token uses:
+    # the WHERE clause is the entire check-and-set, and rowcount decides the outcome. No
+    # method here reads a value and then writes based on it across separate sessions.
+
+    NEWSLETTER_STATES = ("running", "retry", "done", "unrecognized", "failed")
+
+    @staticmethod
+    def _preferences(row: sqlite3.Row | None) -> NewsletterPreferences | None:
+        if row is None:
+            return None
+        return NewsletterPreferences(
+            tenant_id=row["tenant_id"],
+            enabled=bool(row["enabled"]),
+            consent_version=int(row["consent_version"]),
+            consented_at=row["consented_at"],
+            settings_revision=int(row["settings_revision"]),
+            catalogue_revision=int(row["catalogue_revision"]),
+            catalogue_updated_at=row["catalogue_updated_at"],
+            last_served_at=row["last_served_at"],
+            attempt_day=row["attempt_day"],
+            attempts_today=int(row["attempts_today"]),
+        )
+
+    @staticmethod
+    def _publication(row: sqlite3.Row | None) -> Publication | None:
+        if row is None:
+            return None
+        return Publication(
+            tenant_id=row["tenant_id"],
+            id=row["id"],
+            name=row["name"],
+            original_name=row["original_name"],
+            identification_note=row["identification_note"],
+            merged_into_id=row["merged_into_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def newsletter_preferences(self, scope: TenantScope) -> NewsletterPreferences | None:
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT * FROM newsletter_preferences WHERE tenant_id = ?", (scope.tenant_id,)
+            ).fetchone()
+        return self._preferences(row)
+
+    @staticmethod
+    def _touch_catalogue(connection: sqlite3.Connection, tenant_id: str, now: str) -> None:
+        """Advance the tenant's catalogue revision and timestamp.
+
+        The revision is what an in-flight classification captured, so bumping it discards
+        a result computed against publication choices the owner has since changed. The
+        timestamp is what OPDS reports as `updated`, which is why enable and disable bump
+        it too: the root's Newsletters entry changes target then, before any issue has
+        been classified, and a reader that cached the old link would otherwise keep it.
+        """
+        connection.execute(
+            """
+            UPDATE newsletter_preferences
+               SET catalogue_revision = catalogue_revision + 1, catalogue_updated_at = ?
+             WHERE tenant_id = ?
+            """,
+            (now, tenant_id),
+        )
+
+    @staticmethod
+    def _ensure_preferences(connection: sqlite3.Connection, tenant_id: str) -> None:
+        """Create the row a mutation needs, without turning the feature on.
+
+        Separate from the settings form on purpose: a manual correction is available
+        whether or not automatic organization was ever enabled, and making a correction
+        must not quietly opt the account into sending anything anywhere.
+        """
+        connection.execute(
+            # settings_revision is written explicitly rather than left to the column
+            # default: a database created by an earlier build of this schema carries a
+            # different default, and the empty settings form renders 0 either way.
+            "INSERT OR IGNORE INTO newsletter_preferences (tenant_id, settings_revision) VALUES (?, 0)",
+            (tenant_id,),
+        )
+
+    def set_newsletter_organization(
+        self,
+        scope: TenantScope,
+        *,
+        enabled: bool,
+        consent_version: int,
+        settings_revision: int | None,
+        now: str,
+    ) -> bool:
+        """Turn organization on or off, advancing the settings revision either way.
+
+        `settings_revision` is the value the form was rendered with; None accepts any,
+        for the first save when no row exists yet. A stale submission is refused rather
+        than applied, so a tab left open on the enable form cannot undo a later Off.
+
+        Advancing the revision on *both* transitions is what makes Off authoritative
+        against work already in flight: a response that arrives afterwards fails its
+        commit guard, including when the owner turns the feature straight back on.
+        """
+        with self._write_lock, self._session() as connection:
+            self._ensure_preferences(connection, scope.tenant_id)
+            cursor = connection.execute(
+                """
+                UPDATE newsletter_preferences
+                   SET enabled = ?,
+                       consent_version = MAX(consent_version, ?),
+                       consented_at = CASE WHEN ? THEN ? ELSE consented_at END,
+                       settings_revision = settings_revision + 1
+                 WHERE tenant_id = ?
+                   AND (? IS NULL OR settings_revision = ?)
+                """,
+                (
+                    1 if enabled else 0,
+                    consent_version if enabled else 0,
+                    1 if enabled else 0,
+                    now,
+                    scope.tenant_id,
+                    settings_revision,
+                    settings_revision,
+                ),
+            )
+            if cursor.rowcount == 1:
+                # The root catalogue's Newsletters entry changes target on this edge.
+                self._touch_catalogue(connection, scope.tenant_id, now)
+        return cursor.rowcount == 1
+
+    def pause_newsletter_organization(self, scope: TenantScope, *, now: str) -> None:
+        """Stop all automatic work for this tenant and invalidate anything in flight.
+
+        Used at the start of an account purge, before files are deleted: it must not be
+        possible for another browser to re-enable organization, or for a request already
+        sent to commit its answer, while the account is being removed.
+        """
+        with self._write_lock, self._session() as connection:
+            self._ensure_preferences(connection, scope.tenant_id)
+            connection.execute(
+                """
+                UPDATE newsletter_preferences
+                   SET enabled = 0, settings_revision = settings_revision + 1
+                 WHERE tenant_id = ?
+                """,
+                (scope.tenant_id,),
+            )
+            # In the same transaction, because advancing the revision alone is not enough:
+            # a browser still holding a session can load the new revision and re-enable the
+            # feature while the files are being deleted. Revoking here closes that window,
+            # and if the purge then fails the account stays both paused and signed out.
+            connection.execute("DELETE FROM sessions WHERE tenant_id = ?", (scope.tenant_id,))
+            self._touch_catalogue(connection, scope.tenant_id, now)
+
+    # The WHERE fragment every worker commit shares. It is deliberately one expression
+    # rather than a sequence of reads: the write either matches a row that still satisfies
+    # all of it, or it matches nothing and the paid-for answer is thrown away.
+    _COMMIT_GUARD = """
+               AND lease_token = ?
+               AND state = 'running'
+               AND manual = 0
+               AND not_before > ?
+               AND EXISTS (
+                     SELECT 1 FROM newsletter_preferences p
+                      WHERE p.tenant_id = newsletter_organization.tenant_id
+                        AND p.enabled = 1
+                        AND p.settings_revision = ?
+                        AND p.catalogue_revision = ?)
+               AND EXISTS (
+                     SELECT 1 FROM items i
+                       JOIN tenants t ON t.id = i.tenant_id
+                      WHERE i.tenant_id = newsletter_organization.tenant_id
+                        AND i.id = newsletter_organization.item_id
+                        AND i.kind = 'article'
+                        AND i.source = 'newsletter'
+                        AND t.plan = ?
+                        AND (? IS NULL OR i.created_at >= ?))
+    """
+
+    @staticmethod
+    def _guard_params(guard: OrganizationGuard) -> tuple[Any, ...]:
+        return (
+            guard.lease_token,
+            guard.now,
+            guard.settings_revision,
+            guard.catalogue_revision,
+            guard.plan,
+            guard.retention_cutoff,
+            guard.retention_cutoff,
+        )
+
+    def organization_candidates(
+        self,
+        *,
+        now: str,
+        now_day: str,
+        retention_cutoffs: Mapping[str, str | None],
+        daily_limit: int,
+        required_consent_version: int,
+        limit: int = 25,
+    ) -> list[OrganizationCandidate]:
+        """Tenants that may be served now, least recently served first.
+
+        The plan comes back with the row rather than being resolved here: the caller asks
+        steepd.plans for the retention cutoff, so this query never carries a second copy
+        of which plans expire and which do not. Capped tenants are excluded rather than
+        skipped later, so one account at its daily allowance cannot block the others.
+
+        A tenant must actually have work to be a candidate, retention included. Without
+        that, accounts holding nothing but expired-and-unswept issues fill the page, never
+        claim anything, never advance last_served_at, and so sit at the front of this
+        ordering -- starving an account whose id happens to sort after theirs. An account
+        whose recorded consent has been superseded is excluded for the same reason: its
+        dispatches would be refused, and it would spin preparing the same issue forever.
+        """
+        if not retention_cutoffs:
+            return []
+        # The plan-to-cutoff pairs arrive as values, computed by the caller from
+        # steepd.plans. Joining against them restricts to the allowed plans and applies
+        # each plan's retention in one go, without this query knowing which plans expire.
+        pairs = list(retention_cutoffs.items())
+        cutoff_rows = " UNION ALL ".join(["SELECT ? AS plan, ? AS cutoff"] + ["SELECT ?, ?"] * (len(pairs) - 1))
+        cutoff_params = [value for pair in pairs for value in pair]
+        with self._session() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT p.tenant_id, t.plan, p.settings_revision, p.catalogue_revision
+                  FROM newsletter_preferences p
+                  JOIN tenants t ON t.id = p.tenant_id
+                  JOIN ({cutoff_rows}) r ON r.plan = t.plan
+                 WHERE p.enabled = 1
+                   AND p.consent_version >= ?
+                   AND (p.attempt_day IS NULL OR p.attempt_day <> ? OR p.attempts_today < ?)
+                   AND EXISTS (
+                         SELECT 1
+                           FROM items i
+                           LEFT JOIN newsletter_organization o
+                                  ON o.tenant_id = i.tenant_id AND o.item_id = i.id
+                          WHERE i.tenant_id = p.tenant_id
+                            AND i.kind = 'article'
+                            AND i.source = 'newsletter'
+                            AND (r.cutoff IS NULL OR i.created_at >= r.cutoff)
+                            AND (o.item_id IS NULL
+                                 OR (o.manual = 0 AND o.state IN ('running', 'retry') AND o.not_before <= ?)))
+              ORDER BY p.last_served_at IS NOT NULL, p.last_served_at ASC, p.tenant_id ASC
+                 LIMIT ?
+                """,
+                (*cutoff_params, required_consent_version, now_day, daily_limit, now, limit),
+            ).fetchall()
+        return [
+            OrganizationCandidate(
+                tenant_id=row["tenant_id"],
+                plan=row["plan"],
+                settings_revision=int(row["settings_revision"]),
+                catalogue_revision=int(row["catalogue_revision"]),
+            )
+            for row in rows
+        ]
+
+    def finalize_exhausted_claims(
+        self, scope: TenantScope, *, now: str, max_attempts: int, error_code: str = "lease_expired"
+    ) -> int:
+        """Finish due rows that have no attempts left, in either non-terminal state.
+
+        Recovering one into `running` would dispatch a third paid request for an item
+        already allowed two, so it is finalized instead: readable, correctable, and
+        available for an explicit Retry. `retry` is covered as well as `running` because
+        a row parked there with a spent allowance can never be claimed again and would
+        otherwise sit invisible forever -- neither running, nor retryable, nor terminal.
+        """
+        with self._write_lock, self._session() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE newsletter_organization
+                   SET state = 'failed', not_before = NULL, error_code = COALESCE(error_code, ?)
+                 WHERE tenant_id = ?
+                   AND state IN ('running', 'retry')
+                   AND manual = 0
+                   AND not_before <= ?
+                   AND attempts >= ?
+                """,
+                (error_code, scope.tenant_id, now, max_attempts),
+            )
+        return cursor.rowcount
+
+    def claim_organization_item(
+        self,
+        scope: TenantScope,
+        *,
+        now: str,
+        lease_token: str,
+        lease_until: str,
+        retention_cutoff: str | None,
+        max_attempts: int,
+    ) -> ClaimedOrganization | None:
+        """Lease exactly one item, or return None when this tenant has nothing due.
+
+        Two sources, in this order:
+
+        1. Rows already under way -- a retry that has come due, or a lease that expired.
+           These go first so an explicitly requested Retry is responsive instead of
+           queueing behind every newer untouched issue in a large backlog.
+        2. Newsletters with no row at all, newest first, found by anti-join. This is the
+           whole of "scheduling": there is nothing to enqueue because absence is the
+           waiting state.
+
+        Both are single conditional statements, so a second worker during a deployment
+        overlap either gets a row or gets nothing -- never a half-made claim.
+        """
+        with self._write_lock, self._session() as connection:
+            row = connection.execute(
+                """
+                UPDATE newsletter_organization
+                   SET state = 'running', lease_token = ?, not_before = ?, error_code = NULL
+                 WHERE tenant_id = ?
+                   AND item_id = (
+                         SELECT o.item_id
+                           FROM newsletter_organization o
+                           JOIN items i ON i.tenant_id = o.tenant_id AND i.id = o.item_id
+                          WHERE o.tenant_id = ?
+                            AND o.manual = 0
+                            AND o.state IN ('running', 'retry')
+                            AND o.not_before <= ?
+                            AND o.attempts < ?
+                            AND i.kind = 'article'
+                            AND i.source = 'newsletter'
+                            AND (? IS NULL OR i.created_at >= ?)
+                       ORDER BY o.not_before ASC, o.item_id ASC
+                          LIMIT 1)
+                   AND manual = 0
+                   AND state IN ('running', 'retry')
+                   AND not_before <= ?
+              RETURNING item_id, attempts
+                """,
+                (
+                    lease_token,
+                    lease_until,
+                    scope.tenant_id,
+                    scope.tenant_id,
+                    now,
+                    max_attempts,
+                    retention_cutoff,
+                    retention_cutoff,
+                    now,
+                ),
+            ).fetchone()
+
+            if row is None:
+                row = connection.execute(
+                    """
+                    INSERT INTO newsletter_organization (
+                        tenant_id, item_id, state, manual, attempts, lease_token, not_before
+                    )
+                    SELECT i.tenant_id, i.id, 'running', 0, 0, ?, ?
+                      FROM items i
+                      LEFT JOIN newsletter_organization o
+                             ON o.tenant_id = i.tenant_id AND o.item_id = i.id
+                     WHERE i.tenant_id = ?
+                       AND i.kind = 'article'
+                       AND i.source = 'newsletter'
+                       AND (? IS NULL OR i.created_at >= ?)
+                       AND o.item_id IS NULL
+                  ORDER BY i.created_at DESC, i.id DESC
+                     LIMIT 1
+                        ON CONFLICT (tenant_id, item_id) DO NOTHING
+                  RETURNING item_id, attempts
+                    """,
+                    (lease_token, lease_until, scope.tenant_id, retention_cutoff, retention_cutoff),
+                ).fetchone()
+
+            if row is None:
+                return None
+            # Only a claim that produced work advances the fair-scheduling marker, so a
+            # tenant with nothing to do never costs another tenant its turn.
+            connection.execute(
+                "UPDATE newsletter_preferences SET last_served_at = ? WHERE tenant_id = ?",
+                (now, scope.tenant_id),
+            )
+        return ClaimedOrganization(
+            tenant_id=scope.tenant_id,
+            item_id=row["item_id"],
+            lease_token=lease_token,
+            attempts=int(row["attempts"]),
+        )
+
+    def consume_dispatch_allowance(
+        self,
+        scope: TenantScope,
+        item_id: str,
+        *,
+        lease_token: str,
+        day: str,
+        now: str,
+        daily_limit: int,
+        settings_revision: int,
+        required_consent_version: int,
+    ) -> int | None:
+        """Spend one dispatch from the tenant's UTC-day allowance and record the attempt.
+
+        One transaction immediately before the request goes out, for two reasons. It is
+        the cheap check that avoids knowingly paying after an Off or an exhausted cap --
+        it cannot close the instant-after race, which is what the commit guard is for.
+        And it persists the attempt *before* the send, so a crash mid-request never makes
+        a possibly billed attempt look free.
+
+        The consent version is a condition here, not a record: if the policy this asks
+        agreement to ever broadens, raising the required version stops every account that
+        agreed to the older one until they agree again, rather than carrying their old
+        consent forward onto something they were never shown.
+
+        Returns the new count for this day, or None when sending is no longer allowed.
+        """
+        with self._write_lock, self._session() as connection:
+            row = connection.execute(
+                """
+                UPDATE newsletter_preferences
+                   SET attempt_day = ?,
+                       attempts_today = CASE WHEN attempt_day = ? THEN attempts_today + 1 ELSE 1 END
+                 WHERE tenant_id = ?
+                   AND enabled = 1
+                   AND settings_revision = ?
+                   AND consent_version >= ?
+                   AND (attempt_day IS NULL OR attempt_day <> ? OR attempts_today < ?)
+              RETURNING attempts_today
+                """,
+                (day, day, scope.tenant_id, settings_revision, required_consent_version, day, daily_limit),
+            ).fetchone()
+            if row is None:
+                return None
+            attempt = connection.execute(
+                """
+                UPDATE newsletter_organization
+                   SET attempts = attempts + 1
+                 WHERE tenant_id = ? AND item_id = ? AND lease_token = ? AND state = 'running'
+                   AND manual = 0 AND not_before > ?
+                """,
+                (scope.tenant_id, item_id, lease_token, now),
+            )
+            if attempt.rowcount != 1:
+                # The lease moved on between claim and dispatch. Undo the tenant-level
+                # spend rather than charging an allowance against a request never sent.
+                connection.execute(
+                    "UPDATE newsletter_preferences SET attempts_today = attempts_today - 1 WHERE tenant_id = ?",
+                    (scope.tenant_id,),
+                )
+                return None
+        return int(row["attempts_today"])
+
+    def release_organization_claim(self, scope: TenantScope, item_id: str, *, lease_token: str, now: str) -> bool:
+        """Hand back a claim, leaving the item due again.
+
+        A local failure before dispatch -- an unreadable file, a cap reached between claim
+        and send -- never consumed an attempt in the first place, because attempts are
+        spent alongside the dispatch allowance.
+
+        Nothing is ever given back. A request that reached the provider counts, whatever
+        it came back as: a rejected key is still a dispatch, and pretending otherwise let
+        a 500 followed by a 401 buy an item a third and fourth paid try. An item whose
+        allowance really is spent is finished by finalize_exhausted_claims, where the
+        owner can still ask for it explicitly.
+        """
+        with self._write_lock, self._session() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE newsletter_organization
+                   SET state = 'retry', not_before = ?
+                 WHERE tenant_id = ? AND item_id = ? AND lease_token = ? AND state = 'running' AND manual = 0
+                """,
+                (now, scope.tenant_id, item_id, lease_token),
+            )
+        return cursor.rowcount == 1
+
+    def assign_organization_publication(
+        self, scope: TenantScope, item_id: str, *, guard: OrganizationGuard, publication_id: str
+    ) -> bool:
+        """Record a model answer that chose an existing publication.
+
+        The destination must still be canonical: a publication merged away while the
+        request was out is no longer a choice the model was entitled to make, and the
+        catalogue revision in the guard will already have refused the write.
+        """
+        with self._write_lock, self._session() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE newsletter_organization
+                   SET state = 'done', publication_id = ?, not_before = NULL, error_code = NULL
+                 WHERE tenant_id = ? AND item_id = ?
+                   AND EXISTS (
+                         SELECT 1 FROM publications pub
+                          WHERE pub.tenant_id = newsletter_organization.tenant_id
+                            AND pub.id = ?
+                            AND pub.merged_into_id IS NULL)
+                   {self._COMMIT_GUARD}
+                """,
+                (publication_id, scope.tenant_id, item_id, publication_id, *self._guard_params(guard)),
+            )
+            if cursor.rowcount == 1:
+                # The publication's own feed reports this timestamp, and assigning an older
+                # issue changes what that feed contains without changing the newest arrival
+                # date -- so without this a reader would never refetch it.
+                connection.execute(
+                    "UPDATE publications SET updated_at = ? WHERE tenant_id = ? AND id = ?",
+                    (guard.now, scope.tenant_id, publication_id),
+                )
+                self._touch_catalogue(connection, scope.tenant_id, guard.now)
+        return cursor.rowcount == 1
+
+    def create_and_assign_publication(
+        self,
+        scope: TenantScope,
+        item_id: str,
+        *,
+        guard: OrganizationGuard,
+        publication_id: str,
+        name: str,
+    ) -> Publication | None:
+        """Create a publication and assign this issue to it, or do neither.
+
+        Both writes are in one transaction and the guard runs first, so a rejected answer
+        can never leave an empty publication behind. The guard write re-asserts the claim
+        rather than setting a terminal state, because a `done` row with no publication
+        would mean the owner's Keep ungrouped -- a different thing entirely.
+        """
+        with self._write_lock, self._session() as connection:
+            claimed = connection.execute(
+                f"""
+                UPDATE newsletter_organization
+                   SET state = 'running'
+                 WHERE tenant_id = ? AND item_id = ?
+                   {self._COMMIT_GUARD}
+                """,
+                (scope.tenant_id, item_id, *self._guard_params(guard)),
+            )
+            if claimed.rowcount != 1:
+                return None
+            connection.execute(
+                """
+                INSERT INTO publications (
+                    tenant_id, id, name, original_name, identification_note,
+                    merged_into_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, '', NULL, ?, ?)
+                """,
+                (scope.tenant_id, publication_id, name, name, guard.now, guard.now),
+            )
+            connection.execute(
+                """
+                UPDATE newsletter_organization
+                   SET state = 'done', publication_id = ?, not_before = NULL, error_code = NULL
+                 WHERE tenant_id = ? AND item_id = ? AND lease_token = ?
+                """,
+                (publication_id, scope.tenant_id, item_id, guard.lease_token),
+            )
+            self._touch_catalogue(connection, scope.tenant_id, guard.now)
+            row = connection.execute(
+                "SELECT * FROM publications WHERE tenant_id = ? AND id = ?", (scope.tenant_id, publication_id)
+            ).fetchone()
+        return self._publication(row)
+
+    def record_organization_outcome(
+        self,
+        scope: TenantScope,
+        item_id: str,
+        *,
+        guard: OrganizationGuard,
+        state: str,
+        error_code: str | None = None,
+        retry_at: str | None = None,
+    ) -> bool:
+        """Finalize a cycle without an assignment: unknown, failed, or due to retry again.
+
+        Guarded exactly like an assignment. An old worker must not be able to stamp a
+        failure over a newer manual correction, so "no organization change" is not a
+        licence to write without checking.
+        """
+        if state not in ("unrecognized", "failed", "retry"):
+            raise ValueError(f"unsupported organization outcome: {state}")
+        if (state == "retry") != (retry_at is not None):
+            raise ValueError("retry outcomes need a retry time, and only retry outcomes have one")
+        with self._write_lock, self._session() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE newsletter_organization
+                   SET state = ?, not_before = ?, error_code = ?
+                 WHERE tenant_id = ? AND item_id = ?
+                   {self._COMMIT_GUARD}
+                """,
+                (state, retry_at, error_code, scope.tenant_id, item_id, *self._guard_params(guard)),
+            )
+        return cursor.rowcount == 1
+
+    # -- owner corrections --------------------------------------------------
+    # These are the user's path, not the worker's, and they deliberately carry no
+    # `manual = 0` guard: the whole point of Change publication is to overrule an earlier
+    # decision, including an earlier decision of the owner's own.
+
+    def assign_publication_manually(
+        self,
+        scope: TenantScope,
+        item_id: str,
+        *,
+        publication_id: str | None,
+        now: str,
+    ) -> bool:
+        """Set, change, or clear one issue's publication on the owner's instruction.
+
+        An upsert, because absence is the waiting state: the item may have no row at all
+        when a brand-new account corrects something before the worker has reached it. It
+        also clears the lease, so a request already in flight for this item fails its
+        commit guard and cannot overwrite what was just chosen here.
+
+        `publication_id=None` is Keep ungrouped, which is a decision rather than an
+        absence -- that is what `manual` on a `done` row with no publication means.
+        """
+        with self._write_lock, self._session() as connection:
+            # This no-op-if-present insert is the transaction's first write, so everything
+            # below runs with the database write lock already held. Without it the read
+            # that follows could see a publication another connection was in the middle of
+            # changing, and that publication's feed would never learn it lost an issue.
+            self._ensure_preferences(connection, scope.tenant_id)
+            previous = connection.execute(
+                "SELECT publication_id FROM newsletter_organization WHERE tenant_id = ? AND item_id = ?",
+                (scope.tenant_id, item_id),
+            ).fetchone()
+            # One statement: ownership, newsletter kind/source and a canonical destination
+            # are all conditions of the write itself. Checking them in a SELECT first would
+            # read outside any lock -- a merge landing in between could file the issue into
+            # a publication that no longer exists to browse.
+            cursor = connection.execute(
+                """
+                INSERT INTO newsletter_organization (
+                    tenant_id, item_id, publication_id, state, manual, attempts,
+                    lease_token, not_before, error_code
+                )
+                SELECT i.tenant_id, i.id, ?, 'done', 1, 0, NULL, NULL, NULL
+                  FROM items i
+                 WHERE i.tenant_id = ? AND i.id = ? AND i.kind = 'article' AND i.source = 'newsletter'
+                   AND (? IS NULL OR EXISTS (
+                         SELECT 1 FROM publications pub
+                          WHERE pub.tenant_id = i.tenant_id AND pub.id = ? AND pub.merged_into_id IS NULL))
+                ON CONFLICT (tenant_id, item_id) DO UPDATE SET
+                    publication_id = excluded.publication_id,
+                    state = 'done',
+                    manual = 1,
+                    lease_token = NULL,
+                    not_before = NULL,
+                    error_code = NULL
+                """,
+                (publication_id, scope.tenant_id, item_id, publication_id, publication_id),
+            )
+            if cursor.rowcount != 1:
+                return False
+            touched = {publication_id, previous["publication_id"] if previous else None} - {None}
+            for affected in touched:
+                connection.execute(
+                    "UPDATE publications SET updated_at = ? WHERE tenant_id = ? AND id = ?",
+                    (now, scope.tenant_id, affected),
+                )
+            self._touch_catalogue(connection, scope.tenant_id, now)
+        return True
+
+    def manual_assignment_matching(self, scope: TenantScope, item_id: str, name: str) -> str | None:
+        """The publication this item is already manually assigned to under `name`, if any.
+
+        Replay handling for create-and-assign, and nothing more: it is scoped to this one
+        item so that a second submission of the same form does not make a second
+        publication, while leaving two genuinely distinct publications free to share a
+        display name. It is not name-based merging.
+        """
+        with self._session() as connection:
+            row = connection.execute(
+                """
+                SELECT p.id
+                  FROM newsletter_organization o
+                  JOIN publications p ON p.tenant_id = o.tenant_id AND p.id = o.publication_id
+                 WHERE o.tenant_id = ? AND o.item_id = ? AND o.manual = 1
+                   AND p.merged_into_id IS NULL AND p.name = ? COLLATE NOCASE
+                """,
+                (scope.tenant_id, item_id, name),
+            ).fetchone()
+        return row["id"] if row else None
+
+    def edit_publication(
+        self,
+        scope: TenantScope,
+        publication_id: str,
+        *,
+        name: str,
+        identification_note: str,
+        now: str,
+    ) -> bool:
+        """Rename and/or re-note a publication, preserving everything that identifies it.
+
+        `original_name`, the id, the assignments and therefore the OPDS URL are all left
+        alone. A rename is a change of label, not an instruction to reclassify anything.
+        """
+        with self._write_lock, self._session() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE publications
+                   SET name = ?, identification_note = ?, updated_at = ?
+                 WHERE tenant_id = ? AND id = ? AND merged_into_id IS NULL
+                """,
+                (name, identification_note, now, scope.tenant_id, publication_id),
+            )
+            if cursor.rowcount == 1:
+                self._touch_catalogue(connection, scope.tenant_id, now)
+        return cursor.rowcount == 1
+
+    def merge_publications(
+        self, scope: TenantScope, *, source_id: str, target_id: str, now: str
+    ) -> bool:
+        """Combine `source_id` into `target_id`, keeping the source row as an alias.
+
+        The first write is the whole authorization: it succeeds only if both records are
+        this tenant's, distinct, and still canonical. Everything after it is bookkeeping
+        inside the same transaction. Aliases already pointing at the source are repointed
+        at the target in the same breath, so resolution is always one hop and never walks
+        a chain that a later merge could turn into a cycle.
+        """
+        if source_id == target_id:
+            return False
+        with self._write_lock, self._session() as connection:
+            claimed = connection.execute(
+                """
+                UPDATE publications
+                   SET merged_into_id = ?, updated_at = ?
+                 WHERE tenant_id = ? AND id = ? AND merged_into_id IS NULL
+                   AND EXISTS (
+                         SELECT 1 FROM publications target
+                          WHERE target.tenant_id = publications.tenant_id
+                            AND target.id = ?
+                            AND target.merged_into_id IS NULL)
+                """,
+                (target_id, now, scope.tenant_id, source_id, target_id),
+            )
+            if claimed.rowcount != 1:
+                return False
+            connection.execute(
+                """
+                UPDATE newsletter_organization SET publication_id = ?
+                 WHERE tenant_id = ? AND publication_id = ?
+                """,
+                (target_id, scope.tenant_id, source_id),
+            )
+            connection.execute(
+                """
+                UPDATE publications SET merged_into_id = ?, updated_at = ?
+                 WHERE tenant_id = ? AND merged_into_id = ? AND id <> ?
+                """,
+                (target_id, now, scope.tenant_id, source_id, target_id),
+            )
+            connection.execute(
+                "UPDATE publications SET updated_at = ? WHERE tenant_id = ? AND id = ?",
+                (now, scope.tenant_id, target_id),
+            )
+            self._touch_catalogue(connection, scope.tenant_id, now)
+        return True
+
+    def retry_organization_items(
+        self, scope: TenantScope, selections: Sequence[tuple[str, str]], *, now: str
+    ) -> int:
+        """Start a fresh cycle for the terminal results the owner picked.
+
+        An update, never a delete: deleting the row would return the item to the waiting
+        state, where `items.created_at DESC` ordering would put an old issue behind every
+        newer untouched one -- a Retry that appears to do nothing for days. `retry` with
+        `not_before = now` is picked up on the next pass instead.
+
+        Each selection carries the result token it was rendered with, so replaying an old
+        form cannot restart a newer cycle. A second click before the next claim matches
+        nothing, because the row is already `retry`.
+        """
+        if not selections:
+            return 0
+        changed = 0
+        with self._write_lock, self._session() as connection:
+            for item_id, result_token in selections:
+                cursor = connection.execute(
+                    """
+                    UPDATE newsletter_organization
+                       SET state = 'retry', attempts = 0, not_before = ?, error_code = NULL
+                     WHERE tenant_id = ? AND item_id = ? AND lease_token = ?
+                       AND manual = 0 AND state IN ('failed', 'unrecognized')
+                    """,
+                    (now, scope.tenant_id, item_id, result_token),
+                )
+                changed += cursor.rowcount
+        return changed
+
+    # -- reading what was organized ----------------------------------------
+
+    _NEWSLETTER_ITEM = "kind = 'article' AND source = 'newsletter'"
+
+    def organization_progress(self, scope: TenantScope, *, retention_cutoff: str | None) -> OrganizationProgress:
+        """Counts over currently retained newsletters, derived rather than recorded.
+
+        There is no scan-history row to drift out of step with the library: an item that
+        expires takes its organization row with it through the foreign key, so these
+        numbers describe what is here now. Waiting is counted by absence.
+        """
+        with self._session() as connection:
+            row = connection.execute(
+                f"""
+                SELECT
+                    SUM(o.item_id IS NULL)              AS waiting,
+                    SUM(o.state = 'running')            AS running,
+                    SUM(o.state = 'retry')              AS retrying,
+                    SUM(o.state = 'done')               AS organized,
+                    SUM(o.state = 'unrecognized')       AS unrecognized,
+                    SUM(o.state = 'failed')             AS failed
+                  FROM items i
+                  LEFT JOIN newsletter_organization o
+                         ON o.tenant_id = i.tenant_id AND o.item_id = i.id
+                 WHERE i.tenant_id = ? AND i.{self._NEWSLETTER_ITEM}
+                   AND (? IS NULL OR i.created_at >= ?)
+                """,
+                (scope.tenant_id, retention_cutoff, retention_cutoff),
+            ).fetchone()
+        return OrganizationProgress(
+            waiting=int(row["waiting"] or 0),
+            # A row waiting for its retry is still in progress as far as the page is
+            # concerned; the distinction between the two matters only to the worker.
+            running=int(row["running"] or 0) + int(row["retrying"] or 0),
+            organized=int(row["organized"] or 0),
+            unrecognized=int(row["unrecognized"] or 0),
+            failed=int(row["failed"] or 0),
+        )
+
+    def list_unorganized_newsletters(
+        self, scope: TenantScope, *, retention_cutoff: str | None, limit: int = 50, offset: int = 0
+    ) -> list[UnorganizedIssue]:
+        """Retained newsletters with no publication, newest first.
+
+        Includes items still waiting as well as unknown and failed results, because from
+        the reader's side they are one question -- "why is this not in a publication?" --
+        and the answer is the state, not a different page.
+        """
+        with self._session() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT i.id, i.title, COALESCE(o.state, 'waiting') AS state, o.lease_token
+                  FROM items i
+                  LEFT JOIN newsletter_organization o
+                         ON o.tenant_id = i.tenant_id AND o.item_id = i.id
+                 WHERE i.tenant_id = ? AND i.{self._NEWSLETTER_ITEM}
+                   AND (? IS NULL OR i.created_at >= ?)
+                   AND (o.item_id IS NULL OR o.publication_id IS NULL)
+              ORDER BY i.created_at DESC, i.id DESC
+                 LIMIT ? OFFSET ?
+                """,
+                (scope.tenant_id, retention_cutoff, retention_cutoff, limit, offset),
+            ).fetchall()
+        return [
+            UnorganizedIssue(
+                item_id=row["id"],
+                title=row["title"],
+                state=row["state"],
+                # Only a terminal non-manual result can be retried, so only those carry a
+                # token forward to the form.
+                result_token=row["lease_token"] if row["state"] in ("failed", "unrecognized") else None,
+            )
+            for row in rows
+        ]
+
+    def count_unorganized_newsletters(self, scope: TenantScope, *, retention_cutoff: str | None) -> int:
+        with self._session() as connection:
+            row = connection.execute(
+                f"""
+                SELECT COUNT(*)
+                  FROM items i
+                  LEFT JOIN newsletter_organization o
+                         ON o.tenant_id = i.tenant_id AND o.item_id = i.id
+                 WHERE i.tenant_id = ? AND i.{self._NEWSLETTER_ITEM}
+                   AND (? IS NULL OR i.created_at >= ?)
+                   AND (o.item_id IS NULL OR o.publication_id IS NULL)
+                """,
+                (scope.tenant_id, retention_cutoff, retention_cutoff),
+            ).fetchone()
+        return int(row[0])
+
+    def list_publication_summaries(
+        self, scope: TenantScope, *, limit: int = 50, offset: int = 0
+    ) -> list[PublicationSummary]:
+        """Canonical publications that currently hold at least one retained issue.
+
+        The inner join is what hides an empty publication from browsing without deleting
+        it: when the last issue expires the row stays, holding its id and its names, and
+        the shelf simply stops listing it until another issue arrives.
+        """
+        with self._session() as connection:
+            rows = connection.execute(
+                """
+                SELECT p.*, COUNT(o.item_id) AS issue_count
+                  FROM publications p
+                  JOIN newsletter_organization o
+                    ON o.tenant_id = p.tenant_id AND o.publication_id = p.id
+                 WHERE p.tenant_id = ? AND p.merged_into_id IS NULL
+              GROUP BY p.tenant_id, p.id
+              ORDER BY p.name COLLATE NOCASE ASC, p.id ASC
+                 LIMIT ? OFFSET ?
+                """,
+                (scope.tenant_id, limit, offset),
+            ).fetchall()
+        return [
+            PublicationSummary(publication=self._publication(row), issue_count=int(row["issue_count"]))
+            for row in rows
+        ]
+
+    def count_publications(self, scope: TenantScope) -> int:
+        """How many publications the list would show, using that same filter."""
+        with self._session() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) FROM (
+                    SELECT p.id
+                      FROM publications p
+                      JOIN newsletter_organization o
+                        ON o.tenant_id = p.tenant_id AND o.publication_id = p.id
+                     WHERE p.tenant_id = ? AND p.merged_into_id IS NULL
+                  GROUP BY p.tenant_id, p.id)
+                """,
+                (scope.tenant_id,),
+            ).fetchone()
+        return int(row[0])
+
+    def publication(self, scope: TenantScope, publication_id: str) -> Publication | None:
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT * FROM publications WHERE tenant_id = ? AND id = ?", (scope.tenant_id, publication_id)
+            ).fetchone()
+        return self._publication(row)
+
+    def resolve_publication(self, scope: TenantScope, publication_id: str) -> Publication | None:
+        """The canonical record a URL refers to, following at most one merge hop.
+
+        One hop is enough by construction: merging a survivor repoints the aliases that
+        already pointed at it, so no alias ever points at another alias. An old bookmark
+        therefore opens the surviving publication's feed directly, without relying on the
+        reader to follow a redirect.
+        """
+        record = self.publication(scope, publication_id)
+        if record is None or record.is_canonical:
+            return record
+        survivor = self.publication(scope, record.merged_into_id)
+        return survivor if survivor is not None and survivor.is_canonical else None
+
+    def canonical_publications(self, scope: TenantScope, *, limit: int = 500) -> list[Publication]:
+        """Every publication the classifier may choose from, including empty ones.
+
+        Remembered-but-empty publications are included deliberately: when the last issue
+        of a publication expires and the next one arrives, it should rejoin the record it
+        already had rather than start a second one with the same name.
+        """
+        with self._session() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM publications
+                 WHERE tenant_id = ? AND merged_into_id IS NULL
+              ORDER BY name COLLATE NOCASE ASC, id ASC
+                 LIMIT ?
+                """,
+                (scope.tenant_id, limit),
+            ).fetchall()
+        return [self._publication(row) for row in rows]
+
+    def publication_aliases(self, scope: TenantScope) -> dict[str, list[Publication]]:
+        """Merged records grouped under the survivor they point at.
+
+        Their names and notes go to the classifier as clues for that survivor: combining
+        two publications should teach the next issue where to go, not throw away what the
+        owner knew when they combined them.
+        """
+        with self._session() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM publications
+                 WHERE tenant_id = ? AND merged_into_id IS NOT NULL
+              ORDER BY name COLLATE NOCASE ASC, id ASC
+                """,
+                (scope.tenant_id,),
+            ).fetchall()
+        grouped: dict[str, list[Publication]] = {}
+        for row in rows:
+            grouped.setdefault(row["merged_into_id"], []).append(self._publication(row))
+        return grouped
+
+    def correction_examples(
+        self, scope: TenantScope, *, per_publication: int = 3
+    ) -> dict[str, list[tuple[str, str, str]]]:
+        """A few manually assigned issues per publication, as (title, author, source_url).
+
+        Read from the items themselves rather than copied into a history table, so they
+        expire when the issues do and there is nothing extra to retain or purge. One
+        windowed query for the whole tenant, not one query per publication.
+        """
+        with self._session() as connection:
+            rows = connection.execute(
+                """
+                SELECT publication_id, title, author, source_url FROM (
+                    SELECT o.publication_id, i.title, i.author, i.source_url,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY o.publication_id ORDER BY i.created_at DESC, i.id DESC
+                           ) AS rank
+                      FROM newsletter_organization o
+                      JOIN items i ON i.tenant_id = o.tenant_id AND i.id = o.item_id
+                     WHERE o.tenant_id = ? AND o.manual = 1 AND o.publication_id IS NOT NULL)
+                 WHERE rank <= ?
+                """,
+                (scope.tenant_id, per_publication),
+            ).fetchall()
+        examples: dict[str, list[tuple[str, str, str]]] = {}
+        for row in rows:
+            examples.setdefault(row["publication_id"], []).append(
+                (row["title"], row["author"], row["source_url"])
+            )
+        return examples
+
+    def organization_row(self, scope: TenantScope, item_id: str) -> dict[str, Any] | None:
+        """The raw row, for tests and for the worker's own bookkeeping."""
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT * FROM newsletter_organization WHERE tenant_id = ? AND item_id = ?",
+                (scope.tenant_id, item_id),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def newsletter_catalogue_state(self, scope: TenantScope) -> tuple[bool, str | None]:
+        """Whether to offer the publications feed, and when the catalogue last changed.
+
+        One query for the two things every catalogue response needs. The feed is offered
+        once organization is on *or* publications already exist, so turning the setting
+        off does not hide groups the reader can still browse. The timestamp is what makes
+        that switch visible: the root's Newsletters entry changes target before any issue
+        has been classified, and a reader caching on `updated` would otherwise keep
+        following the old link.
+        """
+        with self._session() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    COALESCE((SELECT enabled FROM newsletter_preferences WHERE tenant_id = ?), 0) AS enabled,
+                    EXISTS (SELECT 1 FROM publications WHERE tenant_id = ? AND merged_into_id IS NULL) AS present,
+                    (SELECT catalogue_updated_at FROM newsletter_preferences WHERE tenant_id = ?) AS updated_at
+                """,
+                (scope.tenant_id, scope.tenant_id, scope.tenant_id),
+            ).fetchone()
+        return bool(row["enabled"] or row["present"]), row["updated_at"]
+
+    def create_and_assign_for_owner(
+        self, scope: TenantScope, item_id: str, *, publication_id: str, name: str, now: str
+    ) -> Publication | None:
+        """Create the publication the owner named and put this issue in it, or do neither.
+
+        One transaction, so a name that cannot be assigned -- because the item is not this
+        tenant's newsletter -- does not leave an empty publication behind for them to
+        wonder about. Replay is handled by the caller through manual_assignment_matching,
+        which is scoped to this item and is not name-based merging.
+        """
+        with self._write_lock, self._session() as connection:
+            # The creating INSERT is the first statement and carries every condition,
+            # including the replay check. Detecting a replay in a separate transaction let
+            # two identical submissions both pass it and then both create a publication,
+            # leaving one of them assigned and the other stranded.
+            created = connection.execute(
+                """
+                INSERT INTO publications (
+                    tenant_id, id, name, original_name, identification_note,
+                    merged_into_id, created_at, updated_at
+                )
+                SELECT i.tenant_id, ?, ?, ?, '', NULL, ?, ?
+                  FROM items i
+                 WHERE i.tenant_id = ? AND i.id = ? AND i.kind = 'article' AND i.source = 'newsletter'
+                   AND NOT EXISTS (
+                         SELECT 1
+                           FROM newsletter_organization o
+                           JOIN publications pub
+                             ON pub.tenant_id = o.tenant_id AND pub.id = o.publication_id
+                          WHERE o.tenant_id = i.tenant_id AND o.item_id = i.id AND o.manual = 1
+                            AND pub.merged_into_id IS NULL AND pub.name = ? COLLATE NOCASE)
+                """,
+                (publication_id, name, name, now, now, scope.tenant_id, item_id, name),
+            )
+            if created.rowcount != 1:
+                # Either the item is not this tenant's newsletter, or this exact form has
+                # already been applied to it. Told apart inside the same transaction.
+                existing = connection.execute(
+                    """
+                    SELECT pub.* FROM newsletter_organization o
+                      JOIN publications pub ON pub.tenant_id = o.tenant_id AND pub.id = o.publication_id
+                     WHERE o.tenant_id = ? AND o.item_id = ? AND o.manual = 1
+                       AND pub.merged_into_id IS NULL AND pub.name = ? COLLATE NOCASE
+                    """,
+                    (scope.tenant_id, item_id, name),
+                ).fetchone()
+                return self._publication(existing)
+            self._ensure_preferences(connection, scope.tenant_id)
+            previous = connection.execute(
+                "SELECT publication_id FROM newsletter_organization WHERE tenant_id = ? AND item_id = ?",
+                (scope.tenant_id, item_id),
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO newsletter_organization (
+                    tenant_id, item_id, publication_id, state, manual, attempts,
+                    lease_token, not_before, error_code
+                ) VALUES (?, ?, ?, 'done', 1, 0, NULL, NULL, NULL)
+                ON CONFLICT (tenant_id, item_id) DO UPDATE SET
+                    publication_id = excluded.publication_id,
+                    state = 'done', manual = 1, lease_token = NULL, not_before = NULL, error_code = NULL
+                """,
+                (scope.tenant_id, item_id, publication_id),
+            )
+            # The publication this issue came from changed too, and its feed says so.
+            if previous is not None and previous["publication_id"]:
+                connection.execute(
+                    "UPDATE publications SET updated_at = ? WHERE tenant_id = ? AND id = ?",
+                    (now, scope.tenant_id, previous["publication_id"]),
+                )
+            self._touch_catalogue(connection, scope.tenant_id, now)
+            row = connection.execute(
+                "SELECT * FROM publications WHERE tenant_id = ? AND id = ?", (scope.tenant_id, publication_id)
+            ).fetchone()
+        return self._publication(row)

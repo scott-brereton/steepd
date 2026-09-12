@@ -24,6 +24,10 @@ source for it, under the AGPL, so you can also run your own.
   tracking pixels and tracking parameters are dropped.
 - Both show up on your reader through the same feed. Your reader signs in with the
   username and a device passphrase generated from the account page.
+- The account page shows the same shelves your reader does: Recent, Newsletters, Saved
+  and Books. Saved webpages are grouped by the site they came from. Newsletters can be
+  grouped by publication; that is an opt-in which sends newsletter text to a model
+  provider, described under "Automatic newsletter organization" below.
 - Anyone who has your address can send to it by default. The account page can restrict
   that to listed senders.
 - The account page's **Email Verification** checkbox can relay exactly the next inbound
@@ -119,6 +123,48 @@ Optional, each feature off until set:
 | `SUPPORT_INBOUND_ADDRESS`, `SUPPORT_FORWARD_ADDRESS` | Set together, with `MAIL_FROM_ADDRESS`, to relay mail sent to an address on a Resend-receiving domain to your own mailbox. Only useful if Resend receives your apex domain. |
 | `MAX_UPLOAD_BYTES`, `MAX_ARCHIVE_UNCOMPRESSED_BYTES`, `MAX_ARCHIVE_MEMBERS`, `MAX_COMPRESSION_RATIO`, `WEBHOOK_MAX_BYTES`, `NEWSLETTER_MAX_BODY_BYTES`, `NEWSLETTER_MAX_IMAGE_BYTES`, `NEWSLETTER_MAX_TOTAL_IMAGE_BYTES`, `SERVICE_CHECK_TIMEOUT_SECONDS` | Size and time limits. The defaults in `src/steepd/config.py` are the ones the hosted service runs with. |
 
+### Automatic newsletter organization
+
+Off everywhere by default: the server switch below, and then each account's own opt-in.
+With it off, nothing leaves the machine and the publication pages still work for anyone
+who already has publications.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `NEWSLETTER_AI_ENABLED` | `false` | The service switch. With `LLMKEY` and `LLMMODEL`, starts the organizer thread in production. |
+| `LLMKEY` | — | One operator-owned OpenRouter inference key. Set its **monthly spending limit on OpenRouter**: that limit is the only dollar bound this service has. Never deploy a management key. |
+| `LLMMODEL` | — | Model slug, e.g. `z-ai/glm-5.3-flash`. |
+| `NEWSLETTER_AI_PLANS` | `free,paid` | Which plans are offered the feature. `paid` restricts it to paying accounts. An unknown plan name refuses to start rather than silently disabling the feature. |
+| `NEWSLETTER_AI_DAILY_LIMIT` | `200` | Dispatches per account per UTC day, retries included. A workload and abuse bound, **not** a budget: see below. |
+| `NEWSLETTER_AI_REASONING` | `exclude` | How much reasoning to pay for: `off`, `exclude`, `minimal`, `low`, `medium`, `high`. Reasoning is billed output. Some endpoints refuse `off` outright. |
+| `NEWSLETTER_AI_PROVIDERS` | — | Comma-separated provider order. Set it and fallbacks are disabled. |
+| `NEWSLETTER_AI_MAX_INPUT_PRICE`, `NEWSLETTER_AI_MAX_OUTPUT_PRICE` | `0.10`, `0.40` | USD per million tokens the router may pay. |
+
+Before switching it on, run the compatibility check, which costs a fraction of a cent
+and sends no real mail:
+
+```bash
+LLMKEY=... LLMMODEL=... .venv/bin/python ops/evaluate_publications.py smoke
+```
+
+It reports the provider actually used, the output contract, and the real token counts and
+cost — including reasoning, which a short visible answer does not predict. If you set
+`NEWSLETTER_AI_PROVIDERS` or the price ceilings, pass the same values as `--providers`,
+`--max-input-price` and `--max-output-price` so the check uses the routing production will. `evaluate`
+replays a private fixture directory in delivery order for a held-out accuracy trial.
+
+**On the daily limit.** It stops one account generating unbounded work; it does not
+reserve anyone a share of the key's balance. An account running at 200 dispatches a day
+for a month costs roughly \$1.20 at 5,000 input tokens an issue and roughly \$12 at
+65,000 — so the number to set it from is your monthly budget, your expected account
+count, and how long a large backlog may take, not the cost per issue alone. When the key
+hits its provider-side limit, or is rejected, the worker pauses and the account page says
+so; reading is unaffected. The pause lasts until the process restarts: fix the key or the
+balance on OpenRouter, then redeploy or restart the service to resume.
+
+Changing `LLMMODEL` never re-sends history: completed and unrecognized issues are left
+alone, and only an explicit Retry starts a new cycle.
+
 Plan limits are optional environment variables, read once at startup:
 
 | Variable | Default | Meaning |
@@ -148,7 +194,11 @@ cleanup thread. Changing an account's plan still takes effect without a restart.
 ## What is deliberately not here
 
 - No JavaScript, no template engine, no ORM, no queue, no cache server. The pages are
-  strings, the database is SQLite, background work is one thread.
+  strings, the database is SQLite, background work is two threads: the retention sweep,
+  and the newsletter organizer when it is switched on. Neither is a job system. The
+  organizer has nothing to enqueue — a newsletter with no row in
+  `newsletter_organization` *is* the work still to do, which is why importing mail is
+  untouched by the feature and why turning it on needs no catch-up pass.
 - No web upload. Email is the only way in, on purpose.
 - No RSS, browser extension, paywall bypass, or site-specific extraction rules.
 

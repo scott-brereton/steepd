@@ -613,3 +613,35 @@ def test_an_expired_magic_token_is_not_redeemable(tmp_path):
     issued_at = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
     token = issue_magic_token(database, "e@example.com", now=issued_at)
     assert consume_magic_token(database, token, now=issued_at + timedelta(hours=1)) is None
+
+
+# -- saved pages by site ------------------------------------------------------
+
+
+def test_the_site_feeds_resolve_from_the_root_with_authentication(client_and_tenants):
+    client, (alice, pw), _ = client_and_tenants
+    headers = _auth(alice, pw)
+    client.app.state.storage.store_bytes(
+        TenantScope(alice.id),
+        build_epub(title="A page", author="", language="en", identifier="urn:page", body_html="<p>x</p>"),
+        filename="page.epub", kind="article", source="url", title="A page", source_url="https://example.com/a",
+    )
+
+    root = client.get("/opds", headers=headers)
+    sites_href = next(href for href in _entry_hrefs(root.content) if href.endswith("/opds/sites"))
+    sites = client.get(_local_path(sites_href), headers=headers)
+    assert sites.status_code == 200
+    assert "kind=navigation" in sites.headers["content-type"]
+
+    site_href = next(href for href in _entry_hrefs(sites.content) if "/opds/sites/" in href)
+    site = client.get(_local_path(site_href), headers=headers)
+    assert site.status_code == 200
+    assert "kind=acquisition" in site.headers["content-type"]
+    assert _hrefs(site.content, rel="self") == [f"{BASE_URL}/opds/sites/example.com"]
+    assert b"A page" in site.content
+
+    assert client.get("/opds/sites/nobody.example", headers=headers).status_code == 200, "an empty feed, not a 404"
+    assert client.get("/opds/sites/bad%20host", headers=headers).status_code == 404
+    # Percent-encoded so the client does not fold it into the path before sending.
+    assert client.get("/opds/sites/%2e%2e", headers=headers).status_code == 404
+    assert client.get("/opds/sites").status_code == 401

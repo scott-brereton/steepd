@@ -26,11 +26,16 @@ from steepd.epubgen import build_epub
 from steepd.opds import (
     ACQUISITION_REL,
     EPUB_TYPE,
+    PAGE_SIZE,
     author_from_token,
     author_token,
     build_authors_catalog,
     build_items_catalog,
+    build_publication_catalog,
+    build_publications_catalog,
     build_root_catalog,
+    build_site_catalog,
+    build_sites_catalog,
 )
 from steepd.storage import ItemStorage
 from steepd.tenancy import TenantScope
@@ -247,3 +252,279 @@ def test_author_token_rejects_a_name_past_the_stored_bound():
     assert author_from_token(author_token("A" * 240)) == "A" * 240
     with pytest.raises(ValueError):
         author_from_token(author_token("A" * 241))
+
+
+# -- publications -----------------------------------------------------------
+# The navigation feed carries All newsletters plus a page of publications: 51 entries,
+# inside the 62 a CrossPoint retains, which is why PAGE_SIZE is reused unchanged.
+
+
+@pytest.fixture
+def publication_catalogue(tmp_path):
+    settings = Settings(data_dir=tmp_path, public_base_url=BASE_URL)
+    database = Database(tmp_path / "steepd.sqlite3")
+    database.initialize()
+    storage = ItemStorage(settings, database)
+    storage.initialize()
+    tenant = database.create_tenant(email="a@example.com", inbox_local="a.1")
+    scope = TenantScope(tenant.id)
+    return database, storage, scope
+
+
+def _publish(database, storage, scope, *, publication_name, title, publication_id=None):
+    item = storage.store_bytes(
+        scope,
+        build_epub(title=title, author="", language="en", identifier=f"urn:{title}", body_html=f"<p>{title}</p>"),
+        filename=f"{title}.epub", kind="article", source="newsletter", title=title,
+    ).item
+    now = "2026-09-11T12:00:00+00:00"
+    if publication_id is None:
+        publication_id = f"pub-{publication_name.lower().replace(' ', '-')}"
+        database.create_and_assign_for_owner(
+            scope, item.id, publication_id=publication_id, name=publication_name, now=now
+        )
+    else:
+        database.assign_publication_manually(scope, item.id, publication_id=publication_id, now=now)
+    return item, publication_id
+
+
+def _entries(feed: bytes):
+    root = ElementTree.fromstring(feed)
+    return root.findall("{http://www.w3.org/2005/Atom}entry")
+
+
+def test_the_root_points_newsletters_at_the_flat_feed_until_there_is_anything_to_group(publication_catalogue):
+    database, storage, scope = publication_catalogue
+
+    before = crosspoint_parse(build_root_catalog(database, scope, BASE_URL))
+    newsletters = next(entry for entry in before if entry.title == "Newsletters")
+
+    assert newsletters.href == f"{BASE_URL}/opds/newsletters"
+    assert newsletters.kind == "navigation", "an entry leading to a shelf, as it always was"
+
+
+def test_the_root_points_newsletters_at_the_navigation_feed_once_it_is_on(publication_catalogue):
+    database, storage, scope = publication_catalogue
+    database.set_newsletter_organization(
+        scope, enabled=True, consent_version=1, settings_revision=None, now="2026-09-11T12:00:00+00:00"
+    )
+
+    root = ElementTree.fromstring(build_root_catalog(database, scope, BASE_URL))
+    entry = next(
+        e for e in _entries(build_root_catalog(database, scope, BASE_URL))
+        if e.find("{http://www.w3.org/2005/Atom}title").text == "Newsletters"
+    )
+    link = entry.find("{http://www.w3.org/2005/Atom}link")
+
+    assert link.get("href") == f"{BASE_URL}/opds/publications"
+    # A reader must know it is opening another shelf, not a list of files.
+    assert link.get("type").endswith("kind=navigation")
+    updated = root.find("{http://www.w3.org/2005/Atom}updated").text
+    assert updated >= "2026-09-11T12:00:00+00:00", "the catalogue clock makes the change visible"
+
+
+def test_the_flat_newsletters_feed_keeps_working_for_old_bookmarks(publication_catalogue):
+    database, storage, scope = publication_catalogue
+    _publish(database, storage, scope, publication_name="Alpha", title="Issue one")
+
+    flat = crosspoint_parse(
+        build_items_catalog(
+            database, scope, BASE_URL, title="Newsletters", feed_id="newsletters",
+            kind="article", source="newsletter",
+        )
+    )
+
+    assert [entry.title for entry in flat] == ["Issue one"]
+
+
+@pytest.mark.parametrize("count", [49, 50, 51, 100, 101])
+def test_a_navigation_page_never_exceeds_fifty_one_entries(publication_catalogue, count):
+    database, storage, scope = publication_catalogue
+    for index in range(count):
+        _publish(database, storage, scope, publication_name=f"Pub {index:03d}", title=f"Issue {index:03d}")
+
+    first = _entries(build_publications_catalog(database, scope, BASE_URL))
+    second = _entries(build_publications_catalog(database, scope, BASE_URL, page=2))
+
+    assert len(first) == min(count, PAGE_SIZE) + 1, "All newsletters plus a page of publications"
+    assert len(first) <= 51
+    assert first[0].find("{http://www.w3.org/2005/Atom}title").text == "All newsletters"
+    assert len(second) == max(0, min(count - PAGE_SIZE, PAGE_SIZE)) + 1
+
+
+def test_the_next_link_appears_exactly_when_there_is_another_page(publication_catalogue):
+    database, storage, scope = publication_catalogue
+    for index in range(PAGE_SIZE):
+        _publish(database, storage, scope, publication_name=f"Pub {index:03d}", title=f"Issue {index:03d}")
+
+    def next_link(feed):
+        root = ElementTree.fromstring(feed)
+        return [
+            link.get("href")
+            for link in root.findall("{http://www.w3.org/2005/Atom}link")
+            if link.get("rel") == "next"
+        ]
+
+    assert next_link(build_publications_catalog(database, scope, BASE_URL)) == []
+
+    _publish(database, storage, scope, publication_name="Pub 050", title="Issue 050")
+    assert next_link(build_publications_catalog(database, scope, BASE_URL)) == [
+        f"{BASE_URL}/opds/publications?page=2"
+    ]
+
+
+def test_a_publication_feed_lists_only_its_own_issues(publication_catalogue):
+    database, storage, scope = publication_catalogue
+    _, alpha = _publish(database, storage, scope, publication_name="Alpha", title="Alpha one")
+    _publish(database, storage, scope, publication_name="Alpha", title="Alpha two", publication_id=alpha)
+    _publish(database, storage, scope, publication_name="Beta", title="Beta one")
+
+    feed = crosspoint_parse(build_publication_catalog(database, scope, BASE_URL, publication_id=alpha))
+
+    assert sorted(entry.title for entry in feed) == ["Alpha one", "Alpha two"]
+
+
+def test_a_rename_keeps_the_url_and_a_merge_answers_at_the_old_one(publication_catalogue):
+    database, storage, scope = publication_catalogue
+    _, alpha = _publish(database, storage, scope, publication_name="Alpha", title="Alpha one")
+    _, beta = _publish(database, storage, scope, publication_name="Beta", title="Beta one")
+    now = "2026-09-12T12:00:00+00:00"
+
+    database.edit_publication(scope, alpha, name="Alpha Weekly", identification_note="", now=now)
+    renamed = ElementTree.fromstring(build_publication_catalog(database, scope, BASE_URL, publication_id=alpha))
+    assert renamed.find("{http://www.w3.org/2005/Atom}title").text == "Alpha Weekly"
+    self_link = next(
+        link.get("href")
+        for link in renamed.findall("{http://www.w3.org/2005/Atom}link")
+        if link.get("rel") == "self"
+    )
+    assert self_link == f"{BASE_URL}/opds/publications/{alpha}"
+
+    database.merge_publications(scope, source_id=alpha, target_id=beta, now=now)
+    old_url = crosspoint_parse(build_publication_catalog(database, scope, BASE_URL, publication_id=alpha))
+
+    assert sorted(entry.title for entry in old_url) == ["Alpha one", "Beta one"]
+
+
+def test_an_unknown_or_other_tenants_publication_has_no_feed(publication_catalogue, tmp_path):
+    database, storage, scope = publication_catalogue
+    other = database.create_tenant(email="b@example.com", inbox_local="b.2")
+    other_scope = TenantScope(other.id)
+    _, theirs = _publish(database, storage, other_scope, publication_name="Theirs", title="Theirs one")
+
+    assert build_publication_catalog(database, scope, BASE_URL, publication_id=theirs) is None
+    assert build_publication_catalog(database, scope, BASE_URL, publication_id="nonexistent") is None
+
+
+# -- saved pages by site ------------------------------------------------------
+
+
+def _save(database, storage, scope, *, title, url):
+    return storage.store_bytes(
+        scope,
+        build_epub(title=title, author="", language="en", identifier=f"urn:{title}", body_html=f"<p>{title}</p>"),
+        filename=f"{title}.epub", kind="article", source="url", title=title, source_url=url,
+    ).item
+
+
+def _feed_links(feed: bytes, *, rel: str):
+    root = ElementTree.fromstring(feed)
+    return [link for link in root.findall("{http://www.w3.org/2005/Atom}link") if link.get("rel") == rel]
+
+
+def _link_type(feed: bytes, *, rel: str) -> str:
+    return _feed_links(feed, rel=rel)[0].get("type")
+
+
+def _entry_link(entry):
+    return entry.find("{http://www.w3.org/2005/Atom}link")
+
+
+def test_the_root_points_saved_at_the_flat_feed_until_a_page_is_saved(publication_catalogue):
+    database, storage, scope = publication_catalogue
+
+    def saved_entry():
+        entries = _entries(build_root_catalog(database, scope, BASE_URL))
+        entry = next(e for e in entries if e.find("{http://www.w3.org/2005/Atom}title").text == "Saved")
+        return _entry_link(entry)
+
+    before = saved_entry()
+    assert before.get("href") == f"{BASE_URL}/opds/saved"
+    assert before.get("type").endswith("kind=acquisition")
+
+    _save(database, storage, scope, title="A page", url="https://example.com/a")
+
+    after = saved_entry()
+    assert after.get("href") == f"{BASE_URL}/opds/sites"
+    assert after.get("type").endswith("kind=navigation")
+
+
+def test_the_sites_feed_lists_all_saved_then_one_entry_per_site(publication_catalogue):
+    database, storage, scope = publication_catalogue
+    _save(database, storage, scope, title="One", url="https://www.example.com/1")
+    _save(database, storage, scope, title="Two", url="https://example.com/2")
+    _save(database, storage, scope, title="Three", url="https://other.example/3")
+
+    feed = build_sites_catalog(database, scope, BASE_URL)
+    entries = _entries(feed)
+
+    assert _link_type(feed, rel="self").endswith("kind=navigation")
+    titles = [e.find("{http://www.w3.org/2005/Atom}title").text for e in entries]
+    assert titles == ["All saved", "example.com", "other.example"]
+    assert [_entry_link(e).get("href") for e in entries] == [
+        f"{BASE_URL}/opds/saved", f"{BASE_URL}/opds/sites/example.com", f"{BASE_URL}/opds/sites/other.example"
+    ]
+    assert all(_entry_link(e).get("type").endswith("kind=acquisition") for e in entries), "each opens a list of pages"
+    assert entries[1].find("{http://www.w3.org/2005/Atom}content").text == "2 pages"
+
+
+@pytest.mark.parametrize("count", [50, 51])
+def test_a_sites_page_never_exceeds_fifty_one_entries(publication_catalogue, count):
+    database, storage, scope = publication_catalogue
+    for index in range(count):
+        _save(database, storage, scope, title=f"Page {index:02d}", url=f"https://site{index:02d}.example/p")
+
+    first = build_sites_catalog(database, scope, BASE_URL)
+    second = build_sites_catalog(database, scope, BASE_URL, page=2)
+    next_links = _feed_links(first, rel="next")
+
+    assert len(_entries(first)) == min(count, PAGE_SIZE) + 1
+    assert len(_entries(second)) == max(0, count - PAGE_SIZE) + 1
+    assert [link.get("href") for link in next_links] == ([f"{BASE_URL}/opds/sites?page=2"] if count > PAGE_SIZE else [])
+    assert all(link.get("type").endswith("kind=navigation") for link in next_links)
+
+
+def test_a_site_feed_lists_only_that_sites_pages_and_reports_its_own_path(publication_catalogue):
+    database, storage, scope = publication_catalogue
+    _save(database, storage, scope, title="Mine one", url="https://example.com/1")
+    _save(database, storage, scope, title="Mine two", url="https://www.example.com/2")
+    _save(database, storage, scope, title="Elsewhere", url="https://other.example/3")
+
+    feed = build_site_catalog(database, scope, BASE_URL, host="example.com")
+
+    assert sorted(entry.title for entry in crosspoint_parse(feed)) == ["Mine one", "Mine two"]
+    assert _feed_links(feed, rel="self")[0].get("href") == f"{BASE_URL}/opds/sites/example.com"
+    assert _link_type(feed, rel="self").endswith("kind=acquisition")
+
+
+def test_a_site_with_no_pages_is_an_empty_feed_not_an_error(publication_catalogue):
+    """A bookmark to a site outlives its last page, as an author feed does. Unknown hosts
+    and another account's hosts answer the same way, so the feed says nothing about
+    what anyone else has."""
+    database, storage, scope = publication_catalogue
+    item = _save(database, storage, scope, title="Only one", url="https://example.com/1")
+
+    storage.delete(scope, item.id)
+
+    assert database.list_saved_sites(scope) == []
+    assert _entries(build_site_catalog(database, scope, BASE_URL, host="example.com")) == []
+    assert _entries(build_site_catalog(database, scope, BASE_URL, host="nobody.example")) == []
+
+
+def test_a_host_with_a_port_is_encoded_in_its_link(publication_catalogue):
+    database, storage, scope = publication_catalogue
+    _save(database, storage, scope, title="Local", url="http://example.com:8080/x")
+
+    entries = _entries(build_sites_catalog(database, scope, BASE_URL))
+
+    assert _entry_link(entries[1]).get("href") == f"{BASE_URL}/opds/sites/example.com%3A8080"

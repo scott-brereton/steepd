@@ -35,14 +35,19 @@ from steepd.opds import (
     author_from_token,
     build_authors_catalog,
     build_items_catalog,
+    build_publication_catalog,
+    build_publications_catalog,
     build_root_catalog,
+    build_site_catalog,
+    build_sites_catalog,
 )
+from steepd.publications import Organizer, build_classifier, start_organizer_thread
 from steepd.ratelimit import RateLimiter, RateLimitMiddleware
 from steepd.retention import start_retention_thread
 from steepd.stats import render_stats
 from steepd.storage import ItemStorage
 from steepd.tenancy import TenantScope
-from steepd.web import FORM_ROUTE_LIMITS, build_web_router
+from steepd.web import FORM_ROUTE_LIMITS, build_web_router, is_site_host
 
 LOGGER = logging.getLogger("steepd.app")
 
@@ -90,6 +95,14 @@ def create_app(
     if settings.app_environment == "production":
         start_retention_thread(database, storage)
 
+    # The organizer is built either way, because the account pages read its status and
+    # every manual correction works without it; only the thread that spends money is
+    # gated. Same rule as the sweep: no test grows a background thread, and a deployment
+    # without a key gets an organizer that simply never finds a classifier to use.
+    organizer = Organizer(database, storage, settings, build_classifier(settings))
+    if settings.app_environment == "production" and organizer.classifier is not None:
+        start_organizer_thread(organizer)
+
     if (
         inbound_provider is None
         and settings.resend_api_key
@@ -114,6 +127,7 @@ def create_app(
     app.state.database = database
     app.state.storage = storage
     app.state.inbound_service = inbound_service
+    app.state.organizer = organizer
 
     # Middleware is added innermost first, so this block reads inside-out: the finished
     # stack is SecurityHeaders -> RateLimit -> BodySizeLimit -> routes.
@@ -137,7 +151,7 @@ def create_app(
 
     # The browser layer. Built through a function because its routes need `database` and
     # `settings` the same way device_scope below does, and neither can be a module global.
-    app.include_router(build_web_router(settings, database, storage))
+    app.include_router(build_web_router(settings, database, storage, organizer))
 
     basic = HTTPBasic(auto_error=False)
 
@@ -216,9 +230,41 @@ def create_app(
             scope, title="Newsletters", feed_id="newsletters", page=page, kind="article", source="newsletter"
         )
 
+    @app.get("/opds/publications")
+    def opds_publications(scope: DeviceScope, page: Page = 1) -> Response:
+        return _xml_response(
+            build_publications_catalog(database, scope, settings.public_base_url, page=page),
+            NAVIGATION_TYPE,
+        )
+
+    @app.get("/opds/publications/{publication_id}")
+    def opds_publication(scope: DeviceScope, publication_id: str, page: Page = 1) -> Response:
+        feed = build_publication_catalog(
+            database, scope, settings.public_base_url, publication_id=publication_id, page=page
+        )
+        if feed is None:
+            # Another tenant's id and one that never existed answer identically, so a feed
+            # is never an oracle for what somebody else has.
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such publication")
+        return _xml_response(feed, ACQUISITION_TYPE)
+
     @app.get("/opds/saved")
     def opds_saved(scope: DeviceScope, page: Page = 1) -> Response:
         return _items_feed(scope, title="Saved", feed_id="saved", page=page, kind="article", source="url")
+
+    @app.get("/opds/sites")
+    def opds_sites(scope: DeviceScope, page: Page = 1) -> Response:
+        return _xml_response(
+            build_sites_catalog(database, scope, settings.public_base_url, page=page), NAVIGATION_TYPE
+        )
+
+    @app.get("/opds/sites/{host}")
+    def opds_site(scope: DeviceScope, host: str, page: Page = 1) -> Response:
+        if not is_site_host(host):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such site")
+        return _xml_response(
+            build_site_catalog(database, scope, settings.public_base_url, host=host, page=page), ACQUISITION_TYPE
+        )
 
     @app.get("/opds/books")
     def opds_books(scope: DeviceScope, page: Page = 1) -> Response:

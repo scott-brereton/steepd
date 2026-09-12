@@ -9,6 +9,7 @@ route it is meant to reach is exactly the failure a constructed URL would hide.
 from __future__ import annotations
 
 import base64
+import hashlib
 import html
 import re
 import xml.etree.ElementTree as ElementTree
@@ -304,6 +305,7 @@ def test_the_account_page_refuses_a_missing_or_forged_cookie(web):
 
     client.cookies.set(SESSION_COOKIE, "forged-value", domain="localhost")
     assert client.get("/account", follow_redirects=False).headers["location"] == "/signin"
+    assert client.get("/account/library", follow_redirects=False).headers["location"] == "/signin"
 
 
 def test_the_session_cookie_is_not_reachable_from_script(web):
@@ -437,12 +439,13 @@ def test_a_free_account_shows_its_plan_usage_retention_and_item_removal(web):
     item = _store_item(client, tenant)
 
     body = client.get("/account").text
+    library = client.get("/account/library").text
 
     assert '<span class="title">Free</span>' in body
     assert "100 MB" in body
     assert f"{_human_size(item.size_bytes)} of 100 MB used" in body
     assert f"Items are kept for {client.app.state.settings.free_retention.days} days." in body
-    assert f"removed in {client.app.state.settings.free_retention.days} days" in body
+    assert f"removed in {client.app.state.settings.free_retention.days} days" in library
 
 
 def test_a_paid_account_shows_its_larger_quota_without_retention_notes(web):
@@ -454,11 +457,12 @@ def test_a_paid_account_shows_its_larger_quota_without_retention_notes(web):
     assert database.set_tenant_plan(tenant.id, PAID_PLAN)
 
     body = client.get("/account").text
+    library = client.get("/account/library").text
 
     assert '<span class="title">Paid</span>' in body
     assert "5 GB" in body
     assert "Items are kept for" not in body
-    assert "removed in" not in body
+    assert "removed in" not in library
 
 
 def test_the_usage_meter_width_reflects_actual_storage(web):
@@ -524,7 +528,7 @@ def test_configured_plan_limits_stay_consistent_and_isolated_between_apps(tmp_pa
         body = client.get("/account").text
         assert f"of {free_mb} MB used" in body
         assert f"Items are kept for {period}." in body
-        assert f"removed in {period}" in body
+        assert f"removed in {period}" in client.get("/account/library").text
 
         allowance = free_mb * 1024**2
         _insert_sized_item(client, tenant, size_bytes=allowance * 84 // 100 - item.size_bytes)
@@ -559,15 +563,15 @@ def test_deleting_an_item_removes_the_row_and_the_file(web):
     path = client.app.state.storage.path_for(item)
     assert path.is_file()
 
-    account = client.get("/account")
-    assert "A stored book" in account.text
+    library = client.get("/account/library")
+    assert "A stored book" in library.text
 
     response = client.post(f"/account/items/{item.id}/delete", follow_redirects=False)
     assert response.status_code == 303
-    assert response.headers["location"] == "/account"
+    assert response.headers["location"] == "/account/library"
     assert database.get_item(TenantScope(tenant.id), item.id) is None
     assert not path.exists()
-    assert "A stored book" not in client.get("/account").text
+    assert "A stored book" not in client.get("/account/library").text
 
 
 def test_an_item_title_cannot_carry_markup_onto_the_account_page(web):
@@ -579,19 +583,19 @@ def test_an_item_title_cannot_carry_markup_onto_the_account_page(web):
     tenant = client.app.state.database.tenant_by_email(EMAIL)
     _store_item(client, tenant, title="<script>alert(1)</script>")
 
-    body = client.get("/account").text
+    body = client.get("/account/library").text
     assert "<script>alert(1)</script>" not in body
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in body
 
 
-def test_deleting_an_unknown_item_still_returns_to_the_account_page(web):
+def test_deleting_an_unknown_item_still_returns_to_the_library(web):
     """Deleting is idempotent from where the user is standing, and an error here would
     also report whether an id exists."""
     client, sent = web
     _sign_up(client, sent)
     response = client.post("/account/items/does-not-exist/delete", follow_redirects=False)
     assert response.status_code == 303
-    assert response.headers["location"] == "/account"
+    assert response.headers["location"] == "/account/library"
 
 
 def test_deleting_the_account_removes_the_tenant_its_files_and_its_sessions(web):
@@ -700,7 +704,7 @@ def test_a_long_library_pages_and_the_next_link_reaches_the_remainder(web):
     tenant = _signed_in_tenant(client, sent)
     _insert_items(client, tenant, [f"Book {index:02d}" for index in range(30)])
 
-    first = client.get("/account")
+    first = client.get("/account/library")
     assert first.status_code == 200
     first_titles = _listed_titles(first.text)
     assert len(first_titles) == 25
@@ -727,7 +731,7 @@ def test_the_newest_items_come_first_and_the_last_page_holds_the_oldest(web):
     tenant = _signed_in_tenant(client, sent)
     _insert_items(client, tenant, [f"Book {index:02d}" for index in range(30)])
 
-    first = client.get("/account")
+    first = client.get("/account/library")
     assert _listed_titles(first.text)[0] == "Book 29"
     second = client.get(_followable(first.text, "Next"))
     assert _listed_titles(second.text)[-1] == "Book 00"
@@ -738,7 +742,7 @@ def test_searching_narrows_the_library_and_reports_the_count(web):
     tenant = _signed_in_tenant(client, sent)
     _insert_items(client, tenant, ["Tea one", "Coffee one", "Tea two", "Coffee two", "Tea three"])
 
-    response = client.get("/account", params={"q": "Tea"})
+    response = client.get("/account/library", params={"q": "Tea"})
     assert response.status_code == 200
     assert _listed_titles(response.text) == ["Tea three", "Tea two", "Tea one"]
     assert "3 items match" in response.text
@@ -752,7 +756,7 @@ def test_a_search_of_one_item_is_worded_as_one(web):
     tenant = _signed_in_tenant(client, sent)
     _insert_items(client, tenant, ["Tea one", "Coffee one"])
 
-    body = client.get("/account", params={"q": "Coffee"}).text
+    body = client.get("/account/library", params={"q": "Coffee"}).text
     assert "1 item matches" in body
     assert "1 items match" not in body
 
@@ -771,7 +775,7 @@ def test_a_search_paginates_and_its_next_link_carries_the_query(web):
         [f"Steeping {index:02d}" for index in range(30)] + ["Coffee one", "Coffee two"],
     )
 
-    first = client.get("/account", params={"q": "Steeping"})
+    first = client.get("/account/library", params={"q": "Steeping"})
     assert "30 items match" in first.text
     first_titles = _listed_titles(first.text)
     assert len(first_titles) == 25
@@ -797,7 +801,7 @@ def test_sorting_by_title_orders_the_whole_library_not_one_page(web):
     tenant = _signed_in_tenant(client, sent)
     _insert_items(client, tenant, ["Aardvark"] + [f"Book {index:02d}" for index in range(1, 30)])
 
-    by_date = client.get("/account")
+    by_date = client.get("/account/library")
     assert "Aardvark" not in _listed_titles(by_date.text)
 
     first = client.get(_followable(by_date.text, "Title"))
@@ -818,7 +822,7 @@ def test_sorting_by_oldest_reverses_the_default_order_across_every_page(web):
     tenant = _signed_in_tenant(client, sent)
     _insert_items(client, tenant, [f"Book {index:02d}" for index in range(30)])
 
-    newest = client.get("/account")
+    newest = client.get("/account/library")
     newest_titles = _listed_titles(newest.text) + _listed_titles(client.get(_followable(newest.text, "Next")).text)
 
     oldest = client.get(_followable(newest.text, "Oldest"))
@@ -834,7 +838,7 @@ def test_a_search_that_matches_nothing_says_so_without_erroring(web):
     tenant = _signed_in_tenant(client, sent)
     _insert_items(client, tenant, ["Tea one", "Tea two"])
 
-    response = client.get("/account", params={"q": "cocoa"})
+    response = client.get("/account/library", params={"q": "cocoa"})
     assert response.status_code == 200
     assert "0 items match" in response.text
     assert "Nothing in your library matches that search." in response.text
@@ -846,8 +850,9 @@ def test_an_empty_library_still_says_how_to_start(web):
     client, sent = web
     _signed_in_tenant(client, sent)
 
-    body = client.get("/account").text
+    body = client.get("/account/library").text
     assert "Nothing here yet." in body
+    assert "address above" not in body, "the address is on the account page, not this one"
     assert 'name="q"' not in body
 
 
@@ -872,7 +877,7 @@ def test_nonsense_parameters_fall_back_rather_than_erroring(web, params, expecte
     tenant = _signed_in_tenant(client, sent)
     _insert_items(client, tenant, [f"Book {index:02d}" for index in range(30)])
 
-    response = client.get("/account", params=params)
+    response = client.get("/account/library", params=params)
     assert response.status_code == 200
     assert expected in response.text
     assert len(_listed_titles(response.text)) in (25, 5)
@@ -883,7 +888,7 @@ def test_an_over_long_search_is_ignored_rather_than_applied(web):
     tenant = _signed_in_tenant(client, sent)
     _insert_items(client, tenant, ["Tea one", "Tea two"])
 
-    body = client.get("/account", params={"q": "x" * 161}).text
+    body = client.get("/account/library", params={"q": "x" * 161}).text
     assert "items match" not in body
     assert len(_listed_titles(body)) == 2
 
@@ -899,7 +904,7 @@ def test_markup_cannot_ride_a_title_or_a_search_term_into_the_search_view(web):
     tenant = _signed_in_tenant(client, sent)
     _insert_items(client, tenant, ["<script>alert(1)</script>", "Tea one"])
 
-    body = client.get("/account", params={"q": "<script>alert(1)</script>"}).text
+    body = client.get("/account/library", params={"q": "<script>alert(1)</script>"}).text
     assert "<script>alert(1)</script>" not in body
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in body
     assert "1 item matches" in body
@@ -1519,7 +1524,7 @@ def test_the_first_sign_in_lands_on_the_address_page_and_nothing_else_until_it_i
     client, sent = web
     client.post("/signup", data={"email": EMAIL})
     _redeem(client, _magic_link(sent[-1]))
-    for path in ("/account", "/", "/account?q=x"):
+    for path in ("/account", "/", "/account?q=x", "/account/library", "/account/library?shelf=books"):
         assert client.get(path, follow_redirects=False).headers["location"] == "/account/address"
     assert client.post("/account/rotate", follow_redirects=False).headers["location"] == "/account/address"
     page = client.get("/account/address")
@@ -1828,3 +1833,797 @@ def test_sender_routes_need_a_session_and_same_origin(web):
         "/account/senders/policy", data={"policy": "listed"}, headers={"Origin": "https://evil.example"}
     )
     assert cross_site.status_code == 403
+
+
+# -- newsletters and publications -------------------------------------------
+# Every POST here has a fixed path with the ids in the body, which is what lets the
+# exact-path body-size middleware in app.py cover them all without learning patterns.
+
+
+def _newsletter_client(tmp_path, monkeypatch, **overrides):
+    client, sent = _build_client(
+        tmp_path, monkeypatch,
+        newsletter_ai_enabled=True, newsletter_ai_key="sk-or-test", newsletter_ai_model="test/model",
+        **overrides,
+    )
+    _sign_up(client, sent)
+    database = client.app.state.database
+    tenant = database.tenant_by_email(EMAIL)
+    return client, database, TenantScope(tenant.id)
+
+
+def _newsletter_item(database, scope, item_id, *, title, created=None):
+    database.insert_item(
+        scope,
+        Item(
+            id=item_id, tenant_id=scope.tenant_id, kind="article", sha256=hashlib.sha256(item_id.encode()).hexdigest(),
+            storage_name=f"{item_id}.epub", download_filename=f"{title}.epub", title=title, author="",
+            language="en", identifier=f"urn:{item_id}", source_url="", size_bytes=100,
+            created_at=(created or datetime.now(UTC)).isoformat(), expires_at=None, source="newsletter",
+        ),
+    )
+
+
+
+def _publication(database, scope, publication_id, name, *, now):
+    """A publication row without an issue, the way an owner's earlier correction left one.
+
+    Inserted directly: production creates publications only alongside an assignment, and
+    these tests want the bare record to exercise everything downstream of that.
+    """
+    with database._connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO publications (
+                tenant_id, id, name, original_name, identification_note, merged_into_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, '', NULL, ?, ?)
+            """,
+            (scope.tenant_id, publication_id, name, name, now, now),
+        )
+
+def _submitted_revision(client) -> str:
+    """The settings revision the page actually rendered.
+
+    Read from the form rather than assumed, because assuming it is what let a bug through
+    where the first enable on a new account always conflicted: the empty form rendered one
+    number and the save expected another, so the feature could never be switched on.
+    """
+    match = re.search(r'name="settings_revision" value="(\d+)"', client.get("/account").text)
+    assert match, "the newsletters page did not render a settings revision"
+    return match.group(1)
+
+
+def _enable_organization(client) -> None:
+    response = client.post(
+        "/account/newsletters/settings",
+        data={"enabled": "yes", "consent_version": "1", "settings_revision": _submitted_revision(client)},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303, response.text
+
+
+def test_the_enable_form_states_how_much_it_will_organize(tmp_path, monkeypatch):
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+    for index in range(3):
+        _newsletter_item(database, scope, f"i{index}", title=f"Issue {index}")
+
+    page = client.get("/account")
+
+    assert "3 unprocessed newsletters" in page.text
+    assert "OpenRouter" in page.text, "what leaves the server is stated before it leaves"
+    assert "Your reader password and account credentials are never sent" in page.text
+
+
+def test_a_large_backlog_says_it_will_take_more_than_a_day(tmp_path, monkeypatch):
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch, newsletter_ai_daily_limit=2)
+    for index in range(5):
+        _newsletter_item(database, scope, f"i{index}", title=f"Issue {index}")
+
+    page = client.get("/account")
+
+    assert "Up to 2 are processed a day" in page.text
+
+
+def test_turning_it_on_and_off_is_recorded_with_its_consent(tmp_path, monkeypatch):
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+
+    on = client.post(
+        "/account/newsletters/settings",
+        data={"enabled": "yes", "consent_version": "1", "settings_revision": _submitted_revision(client)},
+        follow_redirects=False,
+    )
+
+    assert on.status_code == 303, "a brand-new account must be able to turn this on at all"
+    preferences = database.newsletter_preferences(scope)
+    assert (preferences.enabled, preferences.consent_version) == (True, 1)
+    assert preferences.consented_at is not None
+
+    client.post(
+        "/account/newsletters/settings",
+        data={"enabled": "no", "settings_revision": str(preferences.settings_revision)},
+    )
+    assert database.newsletter_preferences(scope).enabled is False
+
+
+def test_a_stale_settings_form_cannot_undo_a_later_choice(tmp_path, monkeypatch):
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+    _enable_organization(client)
+    current = database.newsletter_preferences(scope).settings_revision
+    client.post("/account/newsletters/settings", data={"enabled": "no", "settings_revision": str(current)})
+
+    replayed = client.post(
+        "/account/newsletters/settings",
+        # The consent field is present and current, so the only thing left to refuse
+        # this is the revision check itself.
+        data={"enabled": "yes", "consent_version": "1", "settings_revision": str(current)},
+    )
+
+    assert replayed.status_code == 409
+    assert database.newsletter_preferences(scope).enabled is False
+
+
+def test_a_plan_outside_the_deployment_is_told_rather_than_silently_ignored(tmp_path, monkeypatch):
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch, newsletter_ai_plans=("paid",))
+
+    page = client.get("/account")
+    refused = client.post("/account/newsletters/settings", data={"enabled": "yes", "settings_revision": "0"})
+
+    assert "not available on this server" in page.text
+    assert refused.status_code == 400
+    assert database.newsletter_preferences(scope) is None
+
+
+def test_an_owner_can_name_a_publication_and_then_correct_themselves(tmp_path, monkeypatch):
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+    _newsletter_item(database, scope, "i1", title="Issue one")
+
+    client.post("/account/newsletters/assign", data={"item_id": "i1", "new_name": "Stratechery"})
+    first = database.organization_row(scope, "i1")["publication_id"]
+
+    client.post("/account/newsletters/assign", data={"item_id": "i1", "new_name": "Dense Discovery"})
+    second = database.organization_row(scope, "i1")["publication_id"]
+
+    assert first != second, "a second correction must not be refused by the first"
+    assert database.publication(scope, second).name == "Dense Discovery"
+
+    client.post("/account/newsletters/assign", data={"item_id": "i1", "publication_id": ""})
+    row = database.organization_row(scope, "i1")
+    assert (row["manual"], row["publication_id"]) == (1, None), "Keep ungrouped is a decision"
+
+
+def test_submitting_the_same_new_publication_twice_makes_only_one(tmp_path, monkeypatch):
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+    _newsletter_item(database, scope, "i1", title="Issue one")
+
+    for _ in range(2):
+        client.post("/account/newsletters/assign", data={"item_id": "i1", "new_name": "Stratechery"})
+
+    assert len(database.canonical_publications(scope)) == 1
+
+
+def test_another_tenants_item_and_publication_are_both_refused(tmp_path, monkeypatch):
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+    intruder = database.create_tenant(email="other@example.test", inbox_local="other")
+    other_scope = TenantScope(intruder.id)
+    _newsletter_item(database, other_scope, "theirs", title="Not yours")
+    _publication(database, other_scope, "theirpub", "Theirs", now=datetime.now(UTC).isoformat()
+    )
+    _newsletter_item(database, scope, "mine", title="Mine")
+
+    assert client.post("/account/newsletters/assign", data={"item_id": "theirs", "new_name": "X"}).status_code == 400
+    assert (
+        client.post("/account/newsletters/assign", data={"item_id": "mine", "publication_id": "theirpub"})
+    ).status_code == 400
+    assert client.get("/account/publications/theirpub").status_code == 404
+    assert database.organization_row(other_scope, "theirs") is None
+
+
+def test_renaming_keeps_the_url_and_combining_keeps_the_old_one_working(tmp_path, monkeypatch):
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+    for index, name in enumerate(("Alpha", "Beta")):
+        _newsletter_item(database, scope, f"i{index}", title=f"Issue {index}")
+        client.post("/account/newsletters/assign", data={"item_id": f"i{index}", "new_name": name})
+    alpha, beta = sorted(database.canonical_publications(scope), key=lambda p: p.name)
+
+    client.post(
+        "/account/newsletters/publication",
+        data={"publication_id": alpha.id, "name": "Alpha Weekly", "identification_note": "The one by Ada"},
+    )
+    renamed = client.get(f"/account/publications/{alpha.id}")
+
+    assert renamed.status_code == 200 and "Alpha Weekly" in renamed.text
+    assert database.publication(scope, alpha.id).original_name == "Alpha"
+
+    client.post("/account/newsletters/merge", data={"source_id": alpha.id, "target_id": beta.id})
+    old_url = client.get(f"/account/publications/{alpha.id}")
+
+    assert old_url.status_code == 200 and "Beta" in old_url.text
+    assert database.organization_row(scope, "i0")["publication_id"] == beta.id
+
+
+def test_a_stale_merge_form_asks_for_a_fresh_choice_rather_than_guessing(tmp_path, monkeypatch):
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+    for index, name in enumerate(("Alpha", "Beta", "Gamma")):
+        _newsletter_item(database, scope, f"i{index}", title=f"Issue {index}")
+        client.post("/account/newsletters/assign", data={"item_id": f"i{index}", "new_name": name})
+    alpha, beta, gamma = sorted(database.canonical_publications(scope), key=lambda p: p.name)
+    client.post("/account/newsletters/merge", data={"source_id": alpha.id, "target_id": beta.id})
+
+    replayed = client.post("/account/newsletters/merge", data={"source_id": alpha.id, "target_id": gamma.id})
+
+    assert replayed.status_code == 409
+    assert database.publication(scope, alpha.id).merged_into_id == beta.id
+
+
+def test_retry_selects_by_item_and_ignores_a_stale_result_token(tmp_path, monkeypatch):
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+    for index in range(3):
+        _newsletter_item(database, scope, f"i{index}", title=f"Issue {index}")
+    _enable_organization(client)
+    failed = []
+    for index in range(2):
+        # The claim decides which item it takes, so the test follows it rather than
+        # assuming an order.
+        claimed = database.claim_organization_item(
+            scope, now=datetime.now(UTC).isoformat(), lease_token=f"tok{index}",
+            lease_until=(datetime.now(UTC) + timedelta(minutes=2)).isoformat(),
+            retention_cutoff=None, max_attempts=2,
+        )
+        database.record_organization_outcome(
+            scope, claimed.item_id, guard=_guard_for(database, scope, f"tok{index}"),
+            state="failed", error_code="provider_unavailable",
+        )
+        failed.append((claimed.item_id, f"tok{index}"))
+
+    (retried, token), (untouched, _) = failed
+    page = client.get("/account/newsletters")
+    assert f'name="item_{retried}"' in page.text and f'value="{token}"' in page.text
+
+    # Sparse selection: only one box is ticked, and the other carries a token that has
+    # since been replaced, so it matches nothing.
+    client.post("/account/newsletters/retry", data={f"item_{retried}": token, f"item_{untouched}": "stale"})
+
+    assert database.organization_row(scope, retried)["state"] == "retry"
+    assert database.organization_row(scope, untouched)["state"] == "failed", "a stale token matches nothing"
+
+
+def _guard_for(database, scope, token):
+    from steepd.models import OrganizationGuard
+
+    preferences = database.newsletter_preferences(scope)
+    return OrganizationGuard(
+        lease_token=token,
+        settings_revision=preferences.settings_revision,
+        catalogue_revision=preferences.catalogue_revision,
+        plan="free",
+        retention_cutoff=None,
+        now=datetime.now(UTC).isoformat(),
+    )
+
+
+def test_a_long_unicode_form_is_bounded_by_bytes_not_characters(tmp_path, monkeypatch):
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+    _newsletter_item(database, scope, "i1", title="Issue one")
+    client.post("/account/newsletters/assign", data={"item_id": "i1", "new_name": "Alpha"})
+    publication = database.canonical_publications(scope)[0]
+
+    # 620 astral-plane characters is 7.4 KiB once percent-encoded: inside the 16 KiB the
+    # middleware allows for these paths, and comfortably over the old 8 KiB.
+    accepted = client.post(
+        "/account/newsletters/publication",
+        data={"publication_id": publication.id, "name": "😀" * 120, "identification_note": "😀" * 500},
+    )
+    assert accepted.status_code in (303, 200)
+    assert database.publication(scope, publication.id).name == "😀" * 120
+
+    refused = client.post(
+        "/account/newsletters/publication",
+        data={"publication_id": publication.id, "name": "x" * 200, "identification_note": ""},
+    )
+    assert refused.status_code == 400, "character limits are still validated separately"
+
+    oversized = client.post(
+        "/account/newsletters/publication",
+        data={"publication_id": publication.id, "name": "A", "identification_note": "😀" * 20_000},
+    )
+    assert oversized.status_code == 413
+
+
+def test_a_publication_name_is_escaped_everywhere_it_is_shown(tmp_path, monkeypatch):
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+    _newsletter_item(database, scope, "i1", title="Issue one")
+    client.post("/account/newsletters/assign", data={"item_id": "i1", "new_name": '<script>alert(1)</script>'})
+
+    index = client.get("/account/newsletters")
+    detail = client.get(f"/account/publications/{database.canonical_publications(scope)[0].id}")
+
+    for page in (index.text, detail.text):
+        assert "<script>alert(1)</script>" not in page
+        assert "&lt;script&gt;" in page
+
+
+def test_a_publication_page_pages_beyond_fifty_issues(tmp_path, monkeypatch):
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+    _newsletter_item(database, scope, "i00", title="Issue 00")
+    client.post("/account/newsletters/assign", data={"item_id": "i00", "new_name": "Alpha"})
+    publication = database.canonical_publications(scope)[0]
+    # The rest join it by id, the way the chooser offers it. Typing the same name again
+    # would deliberately make a second publication: names are labels, not identities.
+    for index in range(1, 55):
+        _newsletter_item(database, scope, f"i{index:02d}", title=f"Issue {index:02d}")
+        client.post(
+            "/account/newsletters/assign", data={"item_id": f"i{index:02d}", "publication_id": publication.id}
+        )
+
+    first = client.get(f"/account/publications/{publication.id}")
+    second = client.get(f"/account/publications/{publication.id}?page=2")
+
+    assert "55 issues" in first.text
+    assert first.text.count('class="item"') == 50
+    assert second.text.count('class="item"') == 5
+
+
+def test_every_newsletter_post_refuses_a_cross_site_submission(tmp_path, monkeypatch):
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+    paths = (
+        "/account/newsletters/settings",
+        "/account/newsletters/assign",
+        "/account/newsletters/publication",
+        "/account/newsletters/merge",
+        "/account/newsletters/retry",
+    )
+
+    for path in paths:
+        response = client.post(path, data={}, headers={"Origin": "https://evil.example"})
+        assert response.status_code == 403, path
+
+
+def test_the_newsletters_page_needs_a_confirmed_session(tmp_path, monkeypatch):
+    client, _ = _build_client(tmp_path, monkeypatch)
+
+    assert client.get("/account/newsletters", follow_redirects=False).status_code in (303, 307)
+    assert client.get("/account/publications/anything", follow_redirects=False).status_code in (303, 307)
+
+
+def test_the_privacy_page_stops_claiming_nobody_sees_your_reading(tmp_path, monkeypatch):
+    """The old lede was true only while nothing could leave the machine."""
+    off, _ = _build_client(tmp_path / "off", monkeypatch)
+    on, _ = _build_client(tmp_path / "on", monkeypatch, newsletter_ai_enabled=True)
+
+    quiet = off.get("/privacy").text
+    loud = on.get("/privacy").text
+
+    assert "shows none of it to anyone" in quiet.replace("It shows", "shows")
+    assert "OpenRouter" not in quiet, "a server that cannot send anywhere should not say it does"
+
+    assert "unless you turn on newsletter organization" in loud
+    assert "OpenRouter" in loud
+    assert "does not make it anonymous" in loud, "no anonymity claim over newsletter text"
+    assert "Deleting your account deletes all of it" in loud
+
+
+def test_a_brand_new_account_can_turn_organization_on_from_the_page_it_was_offered(tmp_path, monkeypatch):
+    """The whole browser round trip, with nothing about the form assumed.
+
+    The regression this pins: the empty form rendered revision 0 while saving created the
+    row at revision 1 and then demanded a match, so every first enable was a conflict and
+    nobody could ever switch the feature on.
+    """
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+    assert database.newsletter_preferences(scope) is None
+
+    form = client.get("/account").text
+    revision = re.search(r'name="settings_revision" value="(\d+)"', form).group(1)
+    saved = client.post(
+        "/account/newsletters/settings",
+        data={"enabled": "yes", "consent_version": "1", "settings_revision": revision},
+        follow_redirects=False,
+    )
+
+    assert saved.status_code == 303
+    assert database.newsletter_preferences(scope).enabled is True
+    assert "Turn off" in client.get("/account").text
+
+
+def test_an_issue_already_in_a_publication_can_still_be_moved(tmp_path, monkeypatch):
+    """Correcting a wrong-but-confident answer is the common case, so the control has to
+    be on the issue wherever it is shown -- not only where the classifier gave up."""
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+    _newsletter_item(database, scope, "i1", title="Issue one")
+    client.post("/account/newsletters/assign", data={"item_id": "i1", "new_name": "Alpha"})
+    _newsletter_item(database, scope, "i2", title="Issue two")
+    client.post("/account/newsletters/assign", data={"item_id": "i2", "new_name": "Beta"})
+    alpha, beta = sorted(database.canonical_publications(scope), key=lambda p: p.name)
+
+    page = client.get(f"/account/publications/{alpha.id}")
+    assert 'action="/account/newsletters/assign"' in page.text, "no way to correct an organized issue"
+    assert beta.id in page.text, "and no other publication offered to move it to"
+
+    client.post("/account/newsletters/assign", data={"item_id": "i1", "publication_id": beta.id})
+    assert database.organization_row(scope, "i1")["publication_id"] == beta.id
+
+
+def test_older_unorganized_issues_stay_reachable_beyond_the_first_page(tmp_path, monkeypatch):
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+    for index in range(55):
+        _newsletter_item(
+            database, scope, f"i{index:02d}", title=f"Issue {index:02d}",
+            created=datetime.now(UTC) - timedelta(minutes=index),
+        )
+
+    first = client.get("/account/newsletters")
+    second = client.get("/account/newsletters?page=2")
+
+    assert "55 issues" in first.text
+    assert "Issue 00" in first.text and "Issue 54" not in first.text
+    assert "Issue 54" in second.text, "the oldest issue must still be correctable"
+
+
+def test_a_form_showing_the_old_wording_cannot_record_agreement_to_the_new(tmp_path, monkeypatch):
+    """Recording the server's current version regardless meant a policy change silently
+    inherited consent nobody had been shown."""
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+
+    stale = client.post(
+        "/account/newsletters/settings",
+        data={"enabled": "yes", "consent_version": "0", "settings_revision": _submitted_revision(client)},
+    )
+
+    assert stale.status_code == 409
+    assert database.newsletter_preferences(scope) is None or not database.newsletter_preferences(scope).enabled
+
+
+def test_superseded_consent_says_paused_and_offers_the_new_description(tmp_path, monkeypatch):
+    """The worker stops sending for this account, so the page must not keep saying On with
+    nothing but a Turn off button."""
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+    _enable_organization(client)
+    assert "On. This organizes the newsletters already in your library" in client.get("/account").text
+    monkeypatch.setattr("steepd.web.CONSENT_VERSION", 2)
+
+    page = client.get("/account").text
+
+    assert "Paused" in page and "changed since you turned it on" in page
+    assert 'value="2"' in page, "the current version is what the new form submits"
+    assert "Turn on again" in page
+    assert "Automatic organization is paused" in client.get("/account/newsletters").text, "not on: nothing is sent"
+
+
+def test_a_server_that_cannot_classify_does_not_offer_the_setting(tmp_path, monkeypatch):
+    """Default settings: no service flag, no key. Offering Turn on here collects consent
+    for something that will never run, while the privacy page says nothing leaves."""
+    client, sent = _build_client(tmp_path, monkeypatch)
+    _sign_up(client, sent)
+    database = client.app.state.database
+    scope = TenantScope(database.tenant_by_email(EMAIL).id)
+
+    page = client.get("/account").text
+    refused = client.post(
+        "/account/newsletters/settings",
+        data={"enabled": "yes", "consent_version": "1", "settings_revision": "0"},
+    )
+
+    assert "not available on this server" in page
+    # The organize form's own field, a hidden input; the verification checkbox shares the name.
+    assert '<input type="hidden" name="enabled" value="yes">' not in page
+    assert refused.status_code == 400
+    assert database.newsletter_preferences(scope) is None
+
+
+def test_the_enable_form_counts_only_what_the_worker_will_process(tmp_path, monkeypatch):
+    """Keep-ungrouped, unrecognized and failed issues are never re-analyzed, so a count
+    that includes them promises work that will not happen."""
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+    _newsletter_item(database, scope, "waiting", title="Waiting")
+    _newsletter_item(database, scope, "kept", title="Kept ungrouped")
+    database.assign_publication_manually(scope, "kept", publication_id=None, now=datetime.now(UTC).isoformat())
+
+    page = client.get("/account").text
+
+    assert "<strong>1 unprocessed newsletter</strong>" in page
+
+
+def test_the_privacy_page_names_everything_the_request_carries(tmp_path, monkeypatch):
+    on, _ = _build_client(tmp_path, monkeypatch, newsletter_ai_enabled=True)
+
+    page = on.get("/privacy").text
+
+    for phrase in ("identification note", "issues you assigned by hand", "earlier names"):
+        assert phrase in page, phrase
+    assert "and nothing else" not in page, "publication names and notes go too"
+
+
+def test_an_emptied_publication_stays_reachable_for_renaming_or_combining(tmp_path, monkeypatch):
+    """A typo publication corrected away has no issues, so it leaves the shelf -- but it is
+    still offered to the model and in every chooser, so it needs a page to fix it from."""
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+    _newsletter_item(database, scope, "i1", title="Issue one")
+    client.post("/account/newsletters/assign", data={"item_id": "i1", "new_name": "Stratechry"})
+    typo = database.canonical_publications(scope)[0]
+    client.post("/account/newsletters/assign", data={"item_id": "i1", "new_name": "Stratechery"})
+
+    page = client.get("/account/newsletters").text
+
+    assert f'href="/account/publications/{typo.id}"' in page
+    assert "Stratechry" in page
+
+
+def test_an_account_moved_off_an_offered_plan_can_still_turn_it_off(tmp_path, monkeypatch):
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch, newsletter_ai_plans=("paid",))
+    database.set_newsletter_organization(
+        scope, enabled=True, consent_version=1, settings_revision=None, now=datetime.now(UTC).isoformat()
+    )
+
+    page = client.get("/account").text
+    assert "Turn off" in page, "consent must be withdrawable even where nothing is being sent"
+
+    revision = re.search(r'name="settings_revision" value="(\d+)"', page).group(1)
+    off = client.post(
+        "/account/newsletters/settings", data={"enabled": "no", "settings_revision": revision}, follow_redirects=False
+    )
+    assert off.status_code == 303
+    assert database.newsletter_preferences(scope).enabled is False
+
+
+def test_a_populated_publication_past_the_first_fifty_is_not_called_empty(tmp_path, monkeypatch):
+    """Emptiness must come from membership, not from absence in a page-sized list."""
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+    now = datetime.now(UTC).isoformat()
+    for index in range(51):
+        _newsletter_item(database, scope, f"i{index:02d}", title=f"Issue {index:02d}")
+        client.post("/account/newsletters/assign", data={"item_id": f"i{index:02d}", "new_name": f"Pub {index:02d}"})
+    _publication(database, scope, "hollow", "Zed Hollow", now=now)
+
+    page = client.get("/account/newsletters").text
+    empty_section = page.split("<h2>Empty publications</h2>", 1)[1]
+
+    assert "Zed Hollow" in empty_section
+    assert "Pub " not in empty_section, "every populated publication is populated, whatever page it is on"
+    assert page.count("Pub ") == 51, "and every populated one is on the shelf"
+
+
+def test_the_enable_form_counts_work_that_resumes_on_re_enabling(tmp_path, monkeypatch):
+    """A claim released before dispatch -- the setting went off in between -- is a retry
+    row with no attempts spent. Enabling again picks it up, so the count must say so."""
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+    _newsletter_item(database, scope, "i1", title="Issue one")
+    now = datetime.now(UTC)
+    database.claim_organization_item(
+        scope, now=now.isoformat(), lease_token="t", lease_until=(now + timedelta(minutes=2)).isoformat(),
+        retention_cutoff=None, max_attempts=2,
+    )
+    database.release_organization_claim(scope, "i1", lease_token="t", now=now.isoformat())
+
+    page = client.get("/account").text
+
+    assert "<strong>1 unprocessed newsletter</strong>" in page
+
+
+# -- shelves ------------------------------------------------------------------
+# The account page mirrors what a reader shows: one shelf per kind, with a count. The
+# lists themselves live on /account/library and are filtered by the shelf parameter.
+
+
+def _insert_kind(client, tenant, item_id, *, title, kind, source, created=None, source_url=""):
+    client.app.state.database.insert_item(
+        TenantScope(tenant.id),
+        Item(
+            id=item_id, tenant_id=tenant.id, kind=kind, sha256=hashlib.sha256(item_id.encode()).hexdigest(),
+            storage_name=f"{item_id}.epub", download_filename=f"{item_id}.epub", title=title, author="",
+            language="en", identifier=f"urn:{item_id}", source_url=source_url, size_bytes=100,
+            created_at=(created or datetime.now(UTC)).isoformat(), expires_at=None, source=source,
+        ),
+    )
+
+
+def _mixed_library(client, tenant):
+    """Two newsletters, one saved page, one book. Newsletters and saved pages are both
+    articles, so a shelf that filtered on kind alone could not tell them apart."""
+    _insert_kind(client, tenant, "n1", title="Issue one", kind="article", source="newsletter")
+    _insert_kind(client, tenant, "n2", title="Issue two", kind="article", source="newsletter")
+    _insert_kind(client, tenant, "s1", title="A saved page", kind="article", source="url")
+    _insert_kind(client, tenant, "b1", title="A book", kind="book", source="email")
+
+
+def test_the_account_page_lists_the_reader_shelves_with_counts(web):
+    client, sent = web
+    tenant = _signed_in_tenant(client, sent)
+    _mixed_library(client, tenant)
+    other = client.app.state.database.create_tenant(email="other@example.test", inbox_local="other")
+    _insert_kind(client, other, "theirs", title="Not yours", kind="book", source="email")
+
+    body = client.get("/account").text
+    shelves = re.search(r"<h2>Your library</h2>(.*?)</section>", body, re.S).group(1)
+
+    assert '<a href="/account/library">Recent</a>' in shelves and "4 items" in shelves
+    assert '<a href="/account/newsletters">Newsletters</a>' in shelves and "2 items" in shelves
+    assert '<a href="/account/library?shelf=saved">Saved</a>' in shelves and "1 item<" in shelves
+    assert '<a href="/account/library?shelf=books">Books</a>' in shelves
+    assert "Not yours" not in body and "Issue one" not in body, "the account page is an index, not a list"
+
+
+def test_each_shelf_lists_only_its_own_kind(web):
+    client, sent = web
+    tenant = _signed_in_tenant(client, sent)
+    _mixed_library(client, tenant)
+
+    newsletters = client.get("/account/library", params={"shelf": "newsletters"}).text
+    assert _listed_titles(newsletters) == ["Issue two", "Issue one"]
+    assert _listed_titles(client.get("/account/library", params={"shelf": "saved"}).text) == ["A saved page"]
+    assert _listed_titles(client.get("/account/library", params={"shelf": "books"}).text) == ["A book"]
+    assert len(_listed_titles(client.get("/account/library").text)) == 4
+    assert len(_listed_titles(client.get("/account/library", params={"shelf": "nonsense"}).text)) == 4
+
+
+def test_search_sort_and_paging_stay_on_the_shelf(web):
+    """Every control the shelf page emits has to carry the shelf, or one click drops the
+    reader back into the whole library."""
+    client, sent = web
+    tenant = _signed_in_tenant(client, sent)
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    for index in range(30):
+        _insert_kind(client, tenant, f"n{index:02d}", title=f"Issue {index:02d}", kind="article",
+                     source="newsletter", created=base + timedelta(minutes=index))
+    _insert_kind(client, tenant, "b1", title="Issue book", kind="book", source="email")
+
+    first = client.get("/account/library", params={"shelf": "newsletters"})
+    assert len(_listed_titles(first.text)) == 25
+    assert "Issue book" not in first.text
+    assert 'name="shelf" value="newsletters"' in first.text, "the search form carries the shelf"
+
+    second = client.get(_followable(first.text, "Next"))
+    assert "Issue book" not in second.text and len(_listed_titles(second.text)) == 5
+
+    by_title = client.get(_followable(first.text, "Title"))
+    assert "Issue book" not in by_title.text and _listed_titles(by_title.text)[0] == "Issue 00"
+
+    searched = client.get("/account/library", params={"shelf": "newsletters", "q": "Issue"})
+    assert "30 items match" in searched.text, "the book called Issue is not on this shelf"
+    cleared = client.get(_followable(searched.text, "Clear"))
+    assert "Issue book" not in cleared.text and len(_listed_titles(cleared.text)) == 25
+
+
+def test_an_empty_shelf_in_a_populated_library_says_so_plainly(web):
+    client, sent = web
+    tenant = _signed_in_tenant(client, sent)
+    _insert_kind(client, tenant, "b1", title="A book", kind="book", source="email")
+
+    body = client.get("/account/library", params={"shelf": "saved"}).text
+
+    assert "Nothing here yet." in body
+    assert "matches that search" not in body, "no search was made"
+    assert 'href="/account"' in body, "a way back to the account page"
+
+
+def test_old_account_links_are_redirected_to_the_library(web):
+    """Bookmarks and emailed links carry q, sort and page on /account. They keep working by
+    redirect, with the query passed through untouched for the library route to clean."""
+    client, sent = web
+    _signed_in_tenant(client, sent)
+
+    for query in ("page=2", "q=tea&sort=title", "q="):
+        response = client.get(f"/account?{query}", follow_redirects=False)
+        assert response.status_code == 303, query
+        assert response.headers["location"] == f"/account/library?{query}", query
+    assert client.get("/account", follow_redirects=False).status_code == 200
+
+
+def test_the_newsletters_page_says_existing_newsletters_are_organized_too(tmp_path, monkeypatch):
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+    _newsletter_item(database, scope, "i1", title="Issue one")
+    _enable_organization(client)
+
+    account = client.get("/account").text
+    page = client.get("/account/newsletters").text
+
+    assert "On. This organizes the newsletters already in your library" in account
+    assert "1 waiting" in account
+    assert "Automatic organization is on" in page and 'href="/account"' in page, "the page says where the setting is"
+    assert 'href="/account/library?shelf=newsletters"' in page, "a link to every issue, organized or not"
+
+
+def test_the_landing_page_explains_newsletter_organization(web):
+    client, _ = web
+    for accept in ("text/html", "text/markdown"):
+        body = client.get("/", headers={"Accept": accept}).text
+        assert "by publication" in body, accept
+        assert "off until you turn it on" in body, accept
+
+
+# -- saved pages by site ------------------------------------------------------
+
+
+def test_the_saved_shelf_lists_sites_and_a_site_narrows_the_list(web):
+    client, sent = web
+    tenant = _signed_in_tenant(client, sent)
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    for index in range(26):
+        _insert_kind(client, tenant, f"s{index:02d}", title=f"Essay {index:02d}", kind="article", source="url",
+                     source_url=f"https://www.paulgraham.com/{index}.html", created=base + timedelta(minutes=index))
+    _insert_kind(client, tenant, "t1", title="A news story", kind="article", source="url",
+                 source_url="https://nytimes.com/story")
+
+    shelf = client.get("/account/library", params={"shelf": "saved"})
+    assert len(_listed_titles(shelf.text)) == 25, "the page list is untouched by the site list"
+    sites = re.search(r'<p class="fineprint sites">(.*?)</p>', shelf.text, re.S).group(1)
+    assert 'href="/account/library?shelf=saved&amp;site=paulgraham.com">paulgraham.com</a> (26)' in sites
+    assert 'href="/account/library?shelf=saved&amp;site=nytimes.com">nytimes.com</a> (1)' in sites
+
+    site = client.get(_followable(shelf.text, "paulgraham.com"))
+    assert "<h1>paulgraham.com</h1>" in site.text
+    assert "A news story" not in site.text and len(_listed_titles(site.text)) == 25
+    assert 'name="site" value="paulgraham.com"' in site.text, "the search form carries the site"
+
+    second = client.get(_followable(site.text, "Next"))
+    assert "A news story" not in second.text and _listed_titles(second.text) == ["Essay 00"]
+    by_title = client.get(_followable(site.text, "Title"))
+    assert "A news story" not in by_title.text and _listed_titles(by_title.text)[0] == "Essay 00"
+    searched = client.get("/account/library", params={"shelf": "saved", "site": "paulgraham.com", "q": "Essay 1"})
+    assert "10 items match" in searched.text
+    cleared = client.get(_followable(searched.text, "Clear"))
+    assert "A news story" not in cleared.text and len(_listed_titles(cleared.text)) == 25
+
+    back = client.get(_followable(site.text, "Saved"))
+    assert "A news story" in back.text, "the shelf link drops the site"
+
+
+def test_a_site_is_ignored_off_the_saved_shelf_and_when_malformed(web):
+    client, sent = web
+    tenant = _signed_in_tenant(client, sent)
+    _insert_kind(client, tenant, "s1", title="Essay", kind="article", source="url", source_url="https://a.example/1")
+    _insert_kind(client, tenant, "s2", title="Story", kind="article", source="url", source_url="https://b.example/2")
+    _insert_kind(client, tenant, "b1", title="A book", kind="book", source="email")
+
+    books = client.get("/account/library", params={"shelf": "books", "site": "a.example"}).text
+    assert _listed_titles(books) == ["A book"]
+    malformed = client.get("/account/library", params={"shelf": "saved", "site": "bad host"}).text
+    assert sorted(_listed_titles(malformed)) == ["Essay", "Story"]
+    assert "<h1>Saved</h1>" in malformed
+
+
+def test_the_landing_page_says_saved_pages_are_grouped_by_site(web):
+    client, _ = web
+    for accept in ("text/html", "text/markdown"):
+        assert "grouped by the site they came from" in client.get("/", headers={"Accept": accept}).text, accept
+
+
+def test_the_organize_setting_is_on_the_account_page_above_the_library(tmp_path, monkeypatch):
+    """Two clicks down, behind a shelf link that only shows a count, nobody finds it. The
+    long part of the consent text folds away so the account page stays short."""
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch)
+    _newsletter_item(database, scope, "i1", title="Issue one")
+
+    page = client.get("/account").text
+
+    assert page.index("Organize my newsletters") < page.index("<h2>Your library</h2>")
+    # A plain section like Senders and Device password, not a boxed card, and the
+    # progress line lives inside it rather than floating below.
+    section = page[page.index("<section><h2>Organize my newsletters</h2>"):]
+    section = section[: section.index("</section>")]
+    assert "1 waiting" in section and "Refresh" in section
+    assert "—" not in section
+    folded = re.search(r"<details>(.*?)</details>", page, re.S)
+    assert folded, "the sending paragraph is collapsible"
+    assert "<summary>" in folded.group(1) and "Steepd sends newsletter text" in folded.group(1)
+    assert "1 unprocessed newsletter" in page and "Turn on" in page, "the short part stays visible"
+    assert "Organize my newsletters" not in client.get("/account/newsletters").text, "one place for the setting"
+
+
+def test_a_server_pause_is_reported_even_when_the_daily_allowance_is_also_spent(tmp_path, monkeypatch):
+    """A rejected key needs the operator; "continues tomorrow" would be a false promise."""
+    from steepd.publications import WorkerStatus
+
+    client, database, scope = _newsletter_client(tmp_path, monkeypatch, newsletter_ai_daily_limit=1)
+    _newsletter_item(database, scope, "i1", title="Issue one")
+    _enable_organization(client)
+    with database._connect() as connection:
+        connection.execute(
+            "UPDATE newsletter_preferences SET attempt_day = ?, attempts_today = 1 WHERE tenant_id = ?",
+            (datetime.now(UTC).date().isoformat(), scope.tenant_id),
+        )
+    client.app.state.organizer.status = WorkerStatus(paused_code="auth_rejected", paused_at="now")
+
+    page = client.get("/account").text
+
+    assert "needs attention from its operator" in page
+    assert "continues tomorrow" not in page
