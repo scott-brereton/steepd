@@ -47,7 +47,14 @@ from steepd.retention import start_retention_thread
 from steepd.stats import render_stats
 from steepd.storage import ItemStorage
 from steepd.tenancy import TenantScope
-from steepd.web import FORM_ROUTE_LIMITS, build_web_router, is_site_host
+from steepd.web import (
+    FORM_ROUTE_LIMITS,
+    SAVE_URL_PATH,
+    UPLOAD_FORM_OVERHEAD,
+    UPLOAD_PATH,
+    build_web_router,
+    is_site_host,
+)
 
 LOGGER = logging.getLogger("steepd.app")
 
@@ -140,7 +147,12 @@ def create_app(
     # been pulled off the socket.
     app.add_middleware(
         BodySizeLimitMiddleware,
-        route_limits={WEBHOOK_PATH: settings.webhook_max_bytes, **FORM_ROUTE_LIMITS},
+        route_limits={
+            WEBHOOK_PATH: settings.webhook_max_bytes,
+            **FORM_ROUTE_LIMITS,
+            UPLOAD_PATH: settings.max_upload_bytes + UPLOAD_FORM_OVERHEAD,
+        },
+        html_paths=(UPLOAD_PATH, SAVE_URL_PATH),
     )
     # Held on app.state as well as inside the middleware: state is per app instance rather
     # than module-global, the same as database and storage, so two apps in one process
@@ -151,7 +163,9 @@ def create_app(
 
     # The browser layer. Built through a function because its routes need `database` and
     # `settings` the same way device_scope below does, and neither can be a module global.
-    app.include_router(build_web_router(settings, database, storage, organizer))
+    app.include_router(
+        build_web_router(settings, database, storage, organizer, save_url_article=inbound_service.save_url_article)
+    )
 
     basic = HTTPBasic(auto_error=False)
 

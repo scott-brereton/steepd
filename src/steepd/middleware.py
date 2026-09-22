@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from starlette.responses import JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 
@@ -11,9 +11,10 @@ class RequestBodyTooLarge(Exception):
 class BodySizeLimitMiddleware:
     """Reject bounded upload/webhook requests before framework body parsing."""
 
-    def __init__(self, app: ASGIApp, *, route_limits: dict[str, int]) -> None:
+    def __init__(self, app: ASGIApp, *, route_limits: dict[str, int], html_paths: tuple[str, ...] = ()) -> None:
         self.app = app
         self.route_limits = route_limits
+        self.html_paths = html_paths
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -52,9 +53,22 @@ class BodySizeLimitMiddleware:
         except RequestBodyTooLarge:
             await self._reject(scope, receive, send)
 
-    @staticmethod
-    async def _reject(scope: Scope, receive: Receive, send: Send) -> None:
-        response = JSONResponse({"detail": "Request body exceeds the configured limit"}, status_code=413)
+    async def _reject(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("path") in self.html_paths:
+            response = HTMLResponse(
+                '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+                '<meta name="viewport" content="width=device-width, initial-scale=1">'
+                '<title>Steepd — submission too large</title><style>'
+                'body{margin:0;background:#F5F2ED;color:#1A1A2E;font:17px/1.6 system-ui,sans-serif}'
+                'main{max-width:612px;margin:64px auto;padding:0 24px}h1{font-size:28px;line-height:1.2}'
+                'a{color:#8B5E3C}</style></head><body><main><h1>That submission is too large.</h1>'
+                '<p>Choose a smaller EPUB or a shorter article URL and try again.</p>'
+                '<p><a href="/account#add">Back to your account</a></p></main></body></html>',
+                status_code=413,
+                headers={"Cache-Control": "private, no-store"},
+            )
+        else:
+            response = JSONResponse({"detail": "Request body exceeds the configured limit"}, status_code=413)
         await response(scope, receive, send)
 
 

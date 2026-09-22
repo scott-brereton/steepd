@@ -1,4 +1,4 @@
-"""Per-IP request limits on the four endpoints a public launch exposes to abuse.
+"""Request limits for public authentication endpoints and signed-in imports.
 
 Free sign-ups open four doors, and all four are per-client-address problems:
 
@@ -13,6 +13,9 @@ Free sign-ups open four doors, and all four are per-client-address problems:
    credential cache in auth.py only dedupes *repeated* pairs, so a spray of unique
    passwords pays the full cost every time -- the residual that section names, and
    the assumption behind three-word device passphrases.
+
+Browser uploads and URL saves share an account-keyed bucket. Their handlers count
+attempts after resolving the session, before parsing the body or starting remote work.
 
 One instance serves everything, so the state is in-process: a dict of fixed-window
 counters, not a new piece of infrastructure. Counters are held on the app instance
@@ -40,6 +43,7 @@ SIGNUP_BUCKET = "signup"
 SIGNIN_BUCKET = "signin"
 ADDRESS_BUCKET = "address"
 OPDS_AUTH_BUCKET = "opds-auth"
+IMPORT_BUCKET = "import"
 
 _HOUR = 3600.0
 _QUARTER_HOUR = 900.0
@@ -55,6 +59,8 @@ class Policy:
 # svix-signed (an unsigned body is rejected before it costs anything), GET pages are
 # cheap, and a download is the thing a paying tenant came for.
 POLICIES: Mapping[str, Policy] = {
+    # Browser imports share one allowance per account, checked after session resolution.
+    IMPORT_BUCKET: Policy(limit=30, window_seconds=_HOUR),
     # A human signs up once. Five forgives a typo, a back button, and a lightly shared
     # NAT; it does not forgive a script working through an address list.
     SIGNUP_BUCKET: Policy(limit=5, window_seconds=_HOUR),

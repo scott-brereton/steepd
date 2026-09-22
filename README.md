@@ -2,6 +2,7 @@
 
 Email a newsletter, a webpage link or an EPUB to your private Steepd address and it
 appears on your e-reader, ready to read.
+You can also upload EPUBs and save article links from your account page on the website.
 
 Every email you send in is turned into a clean EPUB and added to a personal OPDS
 catalogue. Point your e-reader at that catalogue once and new items just show up. It is
@@ -22,7 +23,11 @@ source for it, under the AGPL, so you can also run your own.
   alone in the subject to file its readable article in Saved. Anything else is treated as
   a newsletter or forwarded article. Images are fetched once and stored inside the EPUB;
   tracking pixels and tracking parameters are dropped.
-- Both show up on your reader through the same feed. Your reader signs in with the
+- Prefer the website? The account page has an **Add to library** section to upload one
+  EPUB or save one public article URL. Books go to Books; articles go to Saved. Import
+  errors appear beside the form. Browser imports share a limit of 30 attempts per account
+  per hour.
+- Everything shows up on your reader through the same feed. Your reader signs in with the
   username and a device passphrase generated from the account page.
 - The account page shows the same shelves your reader does: Recent, Newsletters, Saved
   and Books. Saved webpages are grouped by the site they came from. Newsletters can be
@@ -34,7 +39,7 @@ source for it, under the AGPL, so you can also run your own.
   message to the account email, for services such as Gmail that verify an auto-forwarding
   address. That message bypasses the sender list, is not filed, and the relay switches off
   after the message or five minutes. It cannot forward anywhere else.
-- If something you sent could not be filed, you get one email saying why and up to three
+- If something you emailed could not be filed, you get one email saying why and up to three
   practical things to try.
 
 ## The hosted service

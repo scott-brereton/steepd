@@ -25,7 +25,8 @@ import re
 import secrets
 import sqlite3
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -35,7 +36,10 @@ from urllib.parse import parse_qsl, quote, urlencode, urljoin
 from bs4 import BeautifulSoup, NavigableString, Tag
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from python_multipart.exceptions import MultipartParseError
 from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import UploadFile
+from starlette.formparsers import MultiPartException, MultiPartParser
 
 from steepd.auth import (
     MAGIC_TOKEN_TTL,
@@ -50,6 +54,7 @@ from steepd.auth import (
 )
 from steepd.config import CONSENT_VERSION, Settings
 from steepd.db import AllowedSenderCapReached, Database
+from steepd.epub import EpubImportError, ServiceStorageFull, StorageQuotaExceeded, UploadTooLarge
 from steepd.inboxnames import (
     email_stem,
     is_reserved_inbox_local,
@@ -69,8 +74,10 @@ from steepd.models import (
 from steepd.outbound import OutboundEmailDisabled, OutboundEmailError, send_email
 from steepd.plans import FREE_PLAN, PAID_PLAN, quota_bytes, retention_for
 from steepd.publications import retention_cutoff
+from steepd.ratelimit import IMPORT_BUCKET
 from steepd.storage import ItemStorage
 from steepd.tenancy import TenantScope
+from steepd.urlarticle import UrlArticleError, UrlArticleTooLarge, exact_subject_url
 
 if TYPE_CHECKING:  # the worker is only a type here; the page reads its status by duck typing
     from steepd.publications import Organizer
@@ -109,11 +116,15 @@ USAGE_WARNING_PERCENT = 85
 DELETE_CONFIRMATION_FIELD = "confirm"
 EMAIL_VERIFICATION_RELAY_DURATION = timedelta(minutes=5)
 
-# Every form on these pages is one short field. Registered with the body-size middleware
+# Text forms are small. Registered with the body-size middleware
 # in app.py so an unauthenticated POST cannot make the server buffer an arbitrary body;
 # the item-delete route is absent only because its path carries an id and the middleware
 # matches exact paths.
 FORM_MAX_BYTES = 8 * 1024
+UPLOAD_PATH = "/account/library/upload"
+SAVE_URL_PATH = "/account/library/save-url"
+UPLOAD_FORM_OVERHEAD = 64 * 1024
+IMPORT_NOTICES = {"book": "Added to Books.", "article": "Added to Saved.", "duplicate": "Already in your library."}
 # The newsletter forms carry longer fields -- a 120-character name, a 500-character note,
 # or a page of selected item ids and their result tokens -- and every character can cost
 # twelve bytes once percent-encoded, so 620 characters of astral-plane text alone is
@@ -124,6 +135,7 @@ FORM_ROUTE_LIMITS = {
     **{
         path: FORM_MAX_BYTES
         for path in (
+            SAVE_URL_PATH,
             "/signup",
             "/signin",
             "/signout",
@@ -276,10 +288,20 @@ a{color:var(--almond)}
 .mark span{font:600 18px/1 ui-rounded,-apple-system,system-ui,sans-serif;letter-spacing:.06em}
 form{margin:0 0 14px}
 .field{display:flex;gap:10px;flex-wrap:wrap}
-input[type=email],input[type=search]{flex:1 1 250px;font:16px/1 inherit;padding:14px 16px;
+input[type=email],input[type=search],input[type=url]{flex:1 1 250px;min-width:0;font:inherit;font-size:16px;
+padding:14px 16px;
 border:1px solid var(--rule);border-radius:8px;background:var(--card);color:var(--charcoal)}
-input[type=email]:focus,input[type=search]:focus{outline:2px solid var(--almond);outline-offset:-1px;
-border-color:transparent}
+input[type=email]:focus,input[type=search]:focus,input[type=url]:focus{outline:2px solid var(--almond);
+outline-offset:-1px;border-color:transparent}
+.add-body form{margin:0}
+.add-body form+form{border-top:1px solid var(--rule);padding-top:20px;margin-top:20px}
+.add-body label{display:block;font-weight:600;font-size:15px;margin-bottom:8px}
+.add-body .fineprint{color:#625B52;font-size:13px}
+.add-body input[type=file]{width:100%;min-width:0;font:inherit;font-size:14px;margin:0 0 12px}
+.add-body input[type=file]::file-selector-button{font:inherit;background:var(--parchment);color:var(--charcoal);
+border:1px solid var(--rule);border-radius:6px;padding:8px 12px;margin-right:12px;cursor:pointer}
+.field-error{color:#8A2F2F;font-size:14px;margin:8px 0 0;overflow-wrap:anywhere}
+@media(max-width:520px){.add-body .field button{width:100%}}
 button{font:600 16px/1 ui-rounded,-apple-system,system-ui,sans-serif;padding:14px 26px;border:0;
 border-radius:8px;background:var(--umber);color:#fff;cursor:pointer}
 button:hover{background:#5A3720}
@@ -778,8 +800,8 @@ def _pager(view: LibraryView) -> str:
 def _library_section(view: LibraryView, *, retention: timedelta | None, now: datetime) -> str:
     if not view.library:
         return (
-            '<p class="lede">Nothing here yet. Send something to your Steepd address and it will '
-            "appear in a minute or so.</p>"
+            '<p class="lede">Nothing here yet. Upload a book or save an article from '
+            '<a href="/account#add">your account page</a>, or send something to your Steepd email address.</p>'
         )
     controls = f"{_search_form(view)}{_sort_links(view)}{_search_summary(view)}"
     if not view.items:
@@ -814,6 +836,41 @@ def _site_links(sites: list[SiteSummary], *, total: int) -> str:
     return f'<p class="fineprint sites">Sites: {links}{more}</p>'
 
 
+def _add_to_library(max_upload_bytes: int, *, field: str = "", error: str = "", url: str = "") -> str:
+    """The account page's import section: two native forms, always in view.
+
+    Not a disclosure. It sits on the page a reader lands on after signing in, and a
+    collapsed panel one page further on turned out to be the thing nobody found.
+    """
+    def feedback(name: str) -> str:
+        if field != name:
+            return ""
+        return f'<p class="field-error" id="{name}-error" role="alert">{html.escape(error)}</p>'
+
+    def accessibility(name: str) -> str:
+        if field == name:
+            return f'aria-describedby="{name}-help {name}-error" aria-invalid="true"'
+        return f'aria-describedby="{name}-help"'
+
+    return (
+        '<section id="add"><h2>Add to library</h2><div class="add-body">'
+        f'<form method="post" action="{SAVE_URL_PATH}">'
+        '<label for="article-url">Article URL</label><div class="field">'
+        '<input id="article-url" type="url" name="url" required placeholder="https://…" '
+        f'value="{html.escape(url, quote=True)}" {accessibility("url")}>'
+        '<button type="submit">Save article</button></div>'
+        '<p class="fineprint" id="url-help">Public article links. Saving can take a moment.</p>'
+        f'{feedback("url")}</form>'
+        f'<form method="post" action="{UPLOAD_PATH}" enctype="multipart/form-data">'
+        '<label for="epub-file">EPUB file</label>'
+        '<input id="epub-file" type="file" name="epub" accept=".epub,application/epub+zip" required '
+        f'{accessibility("epub")}>'
+        '<button type="submit">Upload book</button>'
+        f'<p class="fineprint" id="epub-help">EPUB files up to {_human_size(max_upload_bytes)}.</p>'
+        f'{feedback("epub")}</form></div></section>'
+    )
+
+
 def _library_page(
     view: LibraryView,
     *,
@@ -821,12 +878,14 @@ def _library_page(
     now: datetime,
     sites: list[SiteSummary] = (),
     site_total: int = 0,
+    notice: str = "",
 ) -> HTMLResponse:
     title, _, _ = LIBRARY_SHELVES[view.shelf]
     heading = view.site or title
     return _page(
         f"Steepd — {heading.lower()}",
         f"<h1>{html.escape(heading)}</h1>"
+        f"{_notice(notice)}"
         f"{_shelf_links(view)}"
         f"{_site_links(list(sites), total=site_total)}"
         f"{_library_section(view, retention=retention, now=now)}"
@@ -952,6 +1011,7 @@ def _account_page(
     catalogue_url: str,
     email_verification_until: str | None,
     email_verification_available: bool,
+    import_panel: str = "",
     error: str = "",
     status_code: int = status.HTTP_200_OK,
 ) -> HTMLResponse:
@@ -974,6 +1034,7 @@ def _account_page(
         f'<div class="card"><span class="label">Device username</span>'
         f"<code>{html.escape(tenant.opds_username)}</code></div>"
         '<p class="fineprint"><a href="/devices">How to set this up on your reader</a></p>'
+        f"{import_panel}"
         f"{organization}"
         f"{_shelves_section(counts)}"
         f"{_senders_section(tenant, senders, refused)}"
@@ -1266,6 +1327,7 @@ def _landing_page(settings: Settings) -> HTMLResponse:
         "feed into your reader once. No app, no plugin, no cable.</p>"
         '<p class="small">Forward a newsletter, put one webpage URL alone in the email subject, '
         "or attach an EPUB.</p>"
+        '<p class="small">You can also upload books and save article links from your account page.</p>'
         '<p class="small"><strong>EPUB attached means book. A lone subject URL means Saved article. '
         "Anything else means newsletter.</strong></p>"
         "</section>"
@@ -1739,9 +1801,7 @@ FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
 async def _form_fields(request: Request) -> dict[str, str]:
     """Decode a submitted form without Starlette's parser.
 
-    `request.form()` needs python-multipart even for a urlencoded body, and nothing here
-    accepts a file, so pulling in a parser for uploads to read one short text field would
-    add a dependency for a capability these forms deliberately do not have. Bodies are
+    These short text forms do not need the multipart parser used by EPUB uploads. Bodies are
     bounded before they reach here by the limits app.py registers from FORM_ROUTE_LIMITS.
     """
     if request.headers.get("content-type", "").split(";")[0].strip().casefold() != FORM_CONTENT_TYPE:
@@ -1750,6 +1810,53 @@ async def _form_fields(request: Request) -> dict[str, str]:
     # Pages declare UTF-8, so that is what a browser submits; a body that is not valid
     # UTF-8 did not come from one of our forms and fails validation below either way.
     return dict(parse_qsl(body.decode("utf-8", "replace"), keep_blank_values=True))
+
+
+class _UploadParser(MultiPartParser):
+    """Require a complete multipart body, including the closing boundary."""
+
+    complete = False
+
+    def on_end(self) -> None:
+        self.complete = True
+        super().on_end()
+
+    def close(self) -> None:
+        # Starlette 1.6.0 keeps all spools here, even unfinished parts absent from FormData.
+        # Own them until storage finishes; truncated parses can otherwise leak an open file.
+        for spool in self._files_to_close_on_error:
+            spool.close()
+
+
+@asynccontextmanager
+async def _epub_upload(request: Request) -> AsyncIterator[UploadFile]:
+    if request.headers.get("content-type", "").split(";")[0].strip().lower() != "multipart/form-data":
+        raise MultiPartException("Choose one EPUB file to upload.")
+    parser = _UploadParser(request.headers, request.stream(), max_files=1, max_fields=0)
+    try:
+        form = await parser.parse()
+        if not parser.complete:
+            raise MultiPartException("The upload was incomplete.")
+        upload = form.get("epub")
+        if not isinstance(upload, UploadFile) or not upload.filename or not upload.size:
+            raise MultiPartException("Choose one non-empty EPUB file to upload.")
+        yield upload
+    finally:
+        parser.close()
+
+
+def _import_failure(exc: EpubImportError | UrlArticleError, max_upload_bytes: int) -> tuple[int, str]:
+    if isinstance(exc, StorageQuotaExceeded):
+        return 413, "Your library is full. Delete something from your library and try again."
+    if isinstance(exc, ServiceStorageFull):
+        return 507, "Steepd is out of space. Please try again later."
+    if isinstance(exc, UploadTooLarge):
+        return 413, f"Choose an EPUB smaller than {_human_size(max_upload_bytes)}."
+    if isinstance(exc, UrlArticleTooLarge):
+        return 413, "That article is too large to save. Try a shorter article."
+    if isinstance(exc, UrlArticleError):
+        return 422, f"{exc} Check that the link opens a public article and try again."
+    return 422, "That file could not be read as an EPUB. Check the file and try again."
 
 
 def _submitted_email(fields: dict[str, str]) -> str:
@@ -2188,6 +2295,8 @@ def build_web_router(
     database: Database,
     storage: ItemStorage,
     organizer: "Organizer | None" = None,
+    *,
+    save_url_article: Callable[[TenantScope, str], str],
 ) -> APIRouter:
     router = APIRouter()
     verify_same_origin = same_origin_guard(settings.public_base_url)
@@ -2307,6 +2416,9 @@ def build_web_router(
         *,
         error: str = "",
         status_code: int = status.HTTP_200_OK,
+        import_field: str = "",
+        import_error: str = "",
+        import_url: str = "",
     ) -> HTMLResponse:
         scope = TenantScope(tenant.id)
         counts = {
@@ -2333,6 +2445,9 @@ def build_web_router(
                 tenant.id, now=datetime.now(UTC).isoformat()
             ),
             email_verification_available=verification_available,
+            import_panel=_add_to_library(
+                settings.max_upload_bytes, field=import_field, error=import_error, url=import_url
+            ),
             error=error,
             status_code=status_code,
         )
@@ -2544,14 +2659,20 @@ def build_web_router(
             return _redirect(f"/account/library?{request.url.query}")
         return _render_account(session.tenant)
 
-    @router.get("/account/library")
-    def library(
-        session: SignedIn, shelf: str = "", site: str = "", q: str = "", sort: str = "", page: str = ""
-    ) -> Response:
+    def _render_library(
+        tenant: Tenant,
+        *,
+        shelf: str = "",
+        site: str = "",
+        q: str = "",
+        sort: str = "",
+        page: str = "",
+        notice: str = "",
+    ) -> HTMLResponse:
         # Taken as strings and validated by hand rather than declared as typed query
         # parameters: FastAPI would answer `page=nonsense` with a 422 JSON body, and a
         # browser following a stale link deserves the shelf instead.
-        scope = TenantScope(session.tenant.id)
+        scope = TenantScope(tenant.id)
         chosen_shelf = _clean_shelf(shelf)
         view = _library_view(
             scope,
@@ -2568,11 +2689,93 @@ def build_web_router(
             site_total = database.count_saved_sites(scope) if len(sites) == LIBRARY_SITE_LIST_LIMIT else len(sites)
         return _library_page(
             view,
-            retention=retention_for(session.tenant.plan, settings=settings),
+            retention=retention_for(tenant.plan, settings=settings),
             now=datetime.now(UTC),
             sites=sites,
             site_total=site_total,
+            notice=IMPORT_NOTICES.get(notice, ""),
         )
+
+    @router.get("/account/library")
+    def library(
+        session: SignedIn,
+        shelf: str = "",
+        site: str = "",
+        q: str = "",
+        sort: str = "",
+        page: str = "",
+        notice: str = "",
+    ) -> Response:
+        return _render_library(session.tenant, shelf=shelf, site=site, q=q, sort=sort, page=page, notice=notice)
+
+    async def _import_error(tenant: Tenant, field: str, message: str, status_code: int, url: str = "") -> HTMLResponse:
+        return await run_in_threadpool(
+            _render_account,
+            tenant,
+            import_field=field,
+            import_error=f"{message} Choose the file again to retry." if field == "epub" else message,
+            import_url=url,
+            status_code=status_code,
+        )
+
+    async def _limit_import(request: Request, tenant: Tenant, field: str) -> HTMLResponse | None:
+        limiter = request.app.state.rate_limiter
+        if limiter.allow(IMPORT_BUCKET, tenant.id):
+            return None
+        response = await _import_error(tenant, field, "Too many import attempts. Please try again later.", 429)
+        response.headers["Retry-After"] = str(limiter.retry_after(IMPORT_BUCKET, tenant.id))
+        return response
+
+    @router.post(UPLOAD_PATH, dependencies=[SameOrigin])
+    async def upload_book(request: Request, session: SignedIn) -> Response:
+        limited = await _limit_import(request, session.tenant, "epub")
+        if limited is not None:
+            return limited
+        try:
+            async with _epub_upload(request) as upload:
+                # The parser spool and storage's temporary copy coexist until this returns:
+                # roughly twice the upload size on disk (100 MiB at the default limit).
+                result = await run_in_threadpool(
+                    storage.store_chunks,
+                    TenantScope(session.tenant.id),
+                    iter(lambda: upload.file.read(64 * 1024), b""),
+                    filename=upload.filename,
+                    source="upload",
+                )
+        except (MultiPartException, MultipartParseError):
+            return await _import_error(session.tenant, "epub", "Choose one complete, non-empty EPUB file.", 400)
+        except EpubImportError as exc:
+            code, message = _import_failure(exc, settings.max_upload_bytes)
+            return await _import_error(session.tenant, "epub", message, code)
+
+        shelf = "books"
+        if result.duplicate:
+            shelf = next(
+                (
+                    key for key, (_, kind, source) in LIBRARY_SHELVES.items()
+                    if kind == result.item.kind and (source is None or source == result.item.source)
+                ),
+                "recent",
+            )
+        params = {"shelf": shelf, "notice": "duplicate" if result.duplicate else "book"}
+        return _redirect("/account/library?" + urlencode(params))
+
+    @router.post(SAVE_URL_PATH, dependencies=[SameOrigin])
+    async def save_article(request: Request, session: SignedIn) -> Response:
+        limited = await _limit_import(request, session.tenant, "url")
+        if limited is not None:
+            return limited
+        url = (await _form_fields(request)).get("url", "").strip()
+        if exact_subject_url(url) is None:
+            return await _import_error(
+                session.tenant, "url", "Enter one complete http:// or https:// article URL.", 400, url
+            )
+        try:
+            await run_in_threadpool(save_url_article, TenantScope(session.tenant.id), url)
+        except (EpubImportError, UrlArticleError) as exc:
+            code, message = _import_failure(exc, settings.max_upload_bytes)
+            return await _import_error(session.tenant, "url", message, code, url)
+        return _redirect("/account/library?shelf=saved&notice=article")
 
     @router.post("/account/rotate", dependencies=[SameOrigin])
     async def rotate_password(session: SignedIn) -> Response:

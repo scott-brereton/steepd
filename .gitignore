@@ -8,8 +8,8 @@ __pycache__/
 .wrangler/
 .playwright-mcp/
 .superpowers/
-# Operator notes, kept locally only.
-docs/BEFORE-LAUNCH.md
+# Operator notes, plans and mockups, kept locally only.
+docs/
 
 # Local data, databases, and secrets.
 /data/

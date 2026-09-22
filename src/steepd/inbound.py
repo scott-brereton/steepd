@@ -1144,26 +1144,48 @@ class InboundEmailService:
             input_mode="newsletter",
         )
 
+    def save_url_article(
+        self,
+        scope: TenantScope,
+        url: str,
+        *,
+        image_time_budget_seconds: float = REMOTE_IMAGE_TIME_BUDGET_SECONDS,
+    ) -> str:
+        """Convert and store an article for either entry point; return its item ID.
+
+        `image_time_budget_seconds` is the wall-clock ceiling on this one save's remote
+        image fetches. The email path keeps the webhook default. A browser save runs
+        inside a request that the hosting proxy may cut off, so its caller can pass
+        something shorter; past the deadline the remaining images degrade to alt text.
+        """
+        budget = _RemoteImageBudget(
+            remaining_bytes=self.settings.newsletter_max_total_image_bytes,
+            remaining_images=MAX_REMOTE_IMAGES_PER_NEWSLETTER,
+            deadline=self._clock() + image_time_budget_seconds,
+        )
+        convert = self.url_convert if self.url_convert is not None else convert_url_article
+        document = convert(
+            url,
+            public_base_url=self.settings.public_base_url,
+            max_body_bytes=self.settings.newsletter_max_body_bytes,
+            created_at=datetime.now(UTC).isoformat(),
+            fetch_remote_image=self._remote_image_fetcher(budget),
+        )
+        with self._article_lock:
+            title = _next_saved_title(document.title, self.database.list_item_titles(scope, source="url"))
+            document = replace(document, title=title)
+            return LocalNewsletterPublisher(self.storage, scope).publish(
+                document, document.remote_resources, (), source="url"
+            )
+
     def import_url_article(self, scope: TenantScope, email_id: str, url: str) -> InboundResult:
         if self.provider is None or not self.settings.resend_api_key or not self.settings.inbox_domain:
             raise InboundEmailDisabled("Inbound email is not fully configured")
         if not email_id or len(email_id) > 200:
             raise InvalidWebhookEvent("Inbound email ID is invalid")
 
-        budget = _RemoteImageBudget(
-            remaining_bytes=self.settings.newsletter_max_total_image_bytes,
-            remaining_images=MAX_REMOTE_IMAGES_PER_NEWSLETTER,
-            deadline=self._clock() + REMOTE_IMAGE_TIME_BUDGET_SECONDS,
-        )
-        convert = self.url_convert if self.url_convert is not None else convert_url_article
         try:
-            document = convert(
-                url,
-                public_base_url=self.settings.public_base_url,
-                max_body_bytes=self.settings.newsletter_max_body_bytes,
-                created_at=datetime.now(UTC).isoformat(),
-                fetch_remote_image=self._remote_image_fetcher(budget),
-            )
+            self.save_url_article(scope, url)
         except UrlArticleTooLarge as exc:
             LOGGER.warning("Rejected inbound URL article url=%s reason=%s", _loggable_url(url), str(exc))
             return InboundResult(
@@ -1189,19 +1211,6 @@ class InboundEmailService:
                 rejection_category="content",
             )
 
-        try:
-            with self._article_lock:
-                title = _next_saved_title(
-                    document.title,
-                    self.database.list_item_titles(scope, source="url"),
-                )
-                document = replace(document, title=title)
-                LocalNewsletterPublisher(self.storage, scope).publish(
-                    document,
-                    document.remote_resources,
-                    (),
-                    source="url",
-                )
         except EpubImportError as exc:
             LOGGER.warning("Could not store inbound URL article url=%s reason=%s", _loggable_url(url), str(exc))
             return InboundResult(

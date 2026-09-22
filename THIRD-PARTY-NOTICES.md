@@ -14,3 +14,9 @@ strips the leading dice indices and omits the four hyphenated entries; see
 Steepd uses Trafilatura 2.2.0 to extract the readable article and metadata from webpage
 HTML. Trafilatura is published at https://github.com/adbar/trafilatura and licensed under
 the Apache License 2.0 (https://www.apache.org/licenses/LICENSE-2.0).
+
+## python-multipart
+
+Steepd uses python-multipart 0.0.32 to parse browser EPUB uploads. It is published at
+https://github.com/Kludex/python-multipart and licensed under the Apache License 2.0
+(https://www.apache.org/licenses/LICENSE-2.0).
