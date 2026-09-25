@@ -44,7 +44,9 @@ CREATE TABLE IF NOT EXISTS tenants (
     -- a tenant while this is NULL; its inbox_local is a hidden placeholder.
     inbox_confirmed_at TEXT,
     -- 'anyone' or 'listed'. Applied in inbound.py after the tenant resolves.
-    sender_policy TEXT NOT NULL DEFAULT 'anyone'
+    sender_policy TEXT NOT NULL DEFAULT 'anyone',
+    -- 1 when the owner turned on Star and Delete in the reader catalogue (steepd.opds).
+    reader_actions INTEGER NOT NULL DEFAULT 0 CHECK (reader_actions IN (0, 1))
 );
 
 CREATE TABLE IF NOT EXISTS items (
@@ -70,7 +72,10 @@ CREATE TABLE IF NOT EXISTS items (
     -- sweep time (see steepd.plans), deliberately not stamped here: a per-item expiry
     -- would have to be rewritten for every item a tenant owns on an upgrade.
     expires_at TEXT,
-    source TEXT NOT NULL
+    source TEXT NOT NULL,
+    starred_at TEXT,
+    -- See Item.revision.
+    revision INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS items_tenant_sha_idx ON items(tenant_id, sha256);
@@ -286,6 +291,8 @@ CREATE TABLE IF NOT EXISTS trashed_items (
     created_at TEXT NOT NULL,
     expires_at TEXT,
     source TEXT NOT NULL,
+    starred_at TEXT,
+    revision INTEGER NOT NULL DEFAULT 0,
     deleted_at TEXT NOT NULL,
     -- A finished newsletter_organization row, copied here because that row is removed with
     -- the item (ON DELETE CASCADE). Restore puts it back, so a restored issue keeps its
@@ -303,6 +310,8 @@ CREATE TABLE IF NOT EXISTS trashed_items (
 CREATE UNIQUE INDEX IF NOT EXISTS trashed_items_tenant_sha_idx ON trashed_items(tenant_id, sha256);
 CREATE INDEX IF NOT EXISTS trashed_items_tenant_deleted_idx ON trashed_items(tenant_id, deleted_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS trashed_items_deleted_idx ON trashed_items(deleted_at);
+CREATE INDEX IF NOT EXISTS items_tenant_starred_idx
+    ON items(tenant_id, starred_at DESC, id DESC) WHERE starred_at IS NOT NULL;
 
 PRAGMA user_version = 8;
 """
@@ -326,6 +335,23 @@ UPDATE tenants SET inbox_confirmed_at = created_at WHERE inbox_confirmed_at IS N
 PRAGMA user_version = 5;
 COMMIT;
 """
+
+# The reader-actions columns, for tables that predate them, keyed by the column whose
+# absence means the table needs them. Applied in one transaction for the same reason as
+# _MIGRATE_4_TO_5. A table that does not exist yet gets its columns from SCHEMA instead.
+_READER_ACTION_COLUMNS = {
+    "items": (
+        "revision",
+        (
+            "ALTER TABLE items ADD COLUMN starred_at TEXT",
+            "ALTER TABLE items ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
+        ),
+    ),
+    "tenants": (
+        "reader_actions",
+        ("ALTER TABLE tenants ADD COLUMN reader_actions INTEGER NOT NULL DEFAULT 0 CHECK (reader_actions IN (0, 1))",),
+    ),
+}
 
 # A hand-kept list of correspondents, not a mailing list: 50 is far past what anyone
 # curating one by hand reaches, and it keeps a compromised session from filling the table.
@@ -370,6 +396,8 @@ _ITEM_COLUMNS = (
     "created_at",
     "expires_at",
     "source",
+    "starred_at",
+    "revision",
 )
 _ITEM_COLUMN_LIST = ", ".join(_ITEM_COLUMNS)
 
@@ -399,7 +427,9 @@ class Database:
         through CREATE TABLE IF NOT EXISTS, without rewriting the tenants table; a v6
         database gains the three newsletter-organization tables the same way.
 
-        6 -> 7 and 7 -> 8 need no migration branch because they add only tables and indexes, which
+        7 -> 8 also adds columns to items and tenants, through _READER_ACTION_COLUMNS.
+
+        6 -> 7 and the new trash table need no migration branch because they are only tables and indexes, which
         CREATE ... IF NOT EXISTS expresses idempotently. executescript commits each
         statement on its own, so an interrupted run leaves some tables present and
         user_version behind -- and the next start finishes the job rather than having to
@@ -415,6 +445,13 @@ class Database:
                 )
             if version == 4:
                 connection.executescript(_MIGRATE_4_TO_5)
+            statements: list[str] = []
+            for table, (marker, alters) in _READER_ACTION_COLUMNS.items():
+                columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+                if columns and marker not in columns:
+                    statements.extend(alters)
+            if statements:
+                connection.executescript("BEGIN;\n" + ";\n".join(statements) + ";\nCOMMIT;")
             connection.executescript(SCHEMA)
 
     def health(self) -> bool:
@@ -453,7 +490,11 @@ class Database:
 
     @staticmethod
     def _tenant(row: sqlite3.Row | None) -> Tenant | None:
-        return Tenant(**dict(row)) if row is not None else None
+        if row is None:
+            return None
+        values = dict(row)
+        values["reader_actions"] = bool(values.get("reader_actions", 0))
+        return Tenant(**values)
 
     @staticmethod
     def _item(row: sqlite3.Row | None) -> Item | None:
@@ -773,6 +814,15 @@ class Database:
             cursor = connection.execute("UPDATE tenants SET sender_policy = ? WHERE id = ?", (policy, tenant_id))
         return cursor.rowcount == 1
 
+    def set_reader_actions(self, tenant_id: str, enabled: bool) -> bool:
+        with self._write_lock, self._session() as connection:
+            cursor = connection.execute(
+                "UPDATE tenants SET reader_actions = ? WHERE id = ?", (int(enabled), tenant_id)
+            )
+            # The root feed's shelves change shape, so its clock has to move too.
+            self._touch_catalogue(connection, tenant_id, datetime.now(UTC).isoformat())
+        return cursor.rowcount == 1
+
     def list_allowed_senders(self, tenant_id: str) -> list[str]:
         with self._session() as connection:
             rows = connection.execute(
@@ -1009,6 +1059,7 @@ class Database:
         source: str | None,
         publication: str | None = None,
         site: str | None = None,
+        starred: bool = False,
     ) -> tuple[str, list[Any]]:
         clauses = ["tenant_id = ?"]
         params: list[Any] = [scope.tenant_id]
@@ -1041,6 +1092,8 @@ class Database:
         if site is not None:
             clauses.append(f"({SITE_SQL}) = ?")
             params.append(site)
+        if starred:
+            clauses.append("starred_at IS NOT NULL")
         return " AND ".join(clauses), params
 
     # Fixed ORDER BY clauses keyed by name. The clause is interpolated into SQL, so it must
@@ -1050,6 +1103,7 @@ class Database:
         "newest": "created_at DESC, id DESC",
         "oldest": "created_at ASC, id ASC",
         "title": "title COLLATE NOCASE ASC, created_at ASC, id ASC",
+        "starred": "starred_at DESC, id DESC",
     }
 
     def list_items(
@@ -1062,12 +1116,20 @@ class Database:
         source: str | None = None,
         publication: str | None = None,
         site: str | None = None,
+        starred: bool = False,
         limit: int = 50,
         offset: int = 0,
         order: str = "newest",
     ) -> list[Item]:
         where, params = self._item_filters(
-            scope, kind=kind, author=author, query=query, source=source, publication=publication, site=site
+            scope,
+            kind=kind,
+            author=author,
+            query=query,
+            source=source,
+            publication=publication,
+            site=site,
+            starred=starred,
         )
         ordering = self._ITEM_ORDERINGS[order]
         sql = f"SELECT * FROM items WHERE {where} ORDER BY {ordering} LIMIT ? OFFSET ?"
@@ -1095,9 +1157,17 @@ class Database:
         source: str | None = None,
         publication: str | None = None,
         site: str | None = None,
+        starred: bool = False,
     ) -> int:
         where, params = self._item_filters(
-            scope, kind=kind, author=author, query=query, source=source, publication=publication, site=site
+            scope,
+            kind=kind,
+            author=author,
+            query=query,
+            source=source,
+            publication=publication,
+            site=site,
+            starred=starred,
         )
         with self._session() as connection:
             row = connection.execute(f"SELECT COUNT(*) FROM items WHERE {where}", params).fetchone()
@@ -1222,13 +1292,16 @@ class Database:
     # here touches files; ItemStorage calls these under its lock, which is what keeps a
     # trash, a restore, a purge and a retention delete of one item from interleaving.
 
-    def trash_item(self, scope: TenantScope, item_id: str, *, now: str) -> Item | None:
-        """Move an item to the trash. None when this tenant has no such item."""
+    def trash_item(
+        self, scope: TenantScope, item_id: str, *, now: str, expected_revision: int | None = None
+    ) -> Item | None:
+        """Move an item to the trash. None when this tenant has no such item, or when
+        `expected_revision` is given and the item has changed since it was read."""
         with self._write_lock, self._session() as connection:
             row = connection.execute(
                 "SELECT * FROM items WHERE tenant_id = ? AND id = ?", (scope.tenant_id, item_id)
             ).fetchone()
-            if row is None:
+            if row is None or (expected_revision is not None and row["revision"] != expected_revision):
                 return None
             organization = connection.execute(
                 """
@@ -1256,6 +1329,10 @@ class Database:
                     item_id,
                 ),
             )
+            connection.execute(
+                "UPDATE trashed_items SET revision = revision + 1 WHERE tenant_id = ? AND id = ?",
+                (scope.tenant_id, item_id),
+            )
             # Cascades to newsletter_organization. newsletter_deliveries stays, so a repeat
             # forward of a trashed newsletter is still recognised as a repeat.
             connection.execute("DELETE FROM items WHERE tenant_id = ? AND id = ?", (scope.tenant_id, item_id))
@@ -1281,11 +1358,11 @@ class Database:
                 f"SELECT {_ITEM_COLUMN_LIST} FROM trashed_items WHERE tenant_id = ? AND id = ?",
                 (scope.tenant_id, item_id),
             )
-            if created_at is not None:
-                connection.execute(
-                    "UPDATE items SET created_at = ? WHERE tenant_id = ? AND id = ?",
-                    (created_at, scope.tenant_id, item_id),
-                )
+            connection.execute(
+                "UPDATE items SET revision = revision + 1, created_at = COALESCE(?, created_at)"
+                " WHERE tenant_id = ? AND id = ?",
+                (created_at, scope.tenant_id, item_id),
+            )
             organization = None
             if row["organization_state"] is not None:
                 # Merged publications keep their rows, so the id still resolves; a merge
@@ -1333,6 +1410,23 @@ class Database:
                 (now, tenant_id, organization["publication_id"]),
             )
         self._touch_catalogue(connection, tenant_id, now)
+
+    def set_starred(
+        self, scope: TenantScope, item_id: str, *, starred: bool, expected_revision: int, now: str
+    ) -> bool:
+        """Set, never toggle, the star. False when the item is gone or has changed since
+        `expected_revision` was read, in which case nothing is written."""
+        with self._write_lock, self._session() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE items SET starred_at = ?, revision = revision + 1
+                 WHERE tenant_id = ? AND id = ? AND revision = ?
+                """,
+                (now if starred else None, scope.tenant_id, item_id, expected_revision),
+            )
+            if cursor.rowcount == 1:
+                self._touch_catalogue(connection, scope.tenant_id, now)
+        return cursor.rowcount == 1
 
     def get_trashed_item(self, scope: TenantScope, item_id: str) -> TrashedItem | None:
         with self._session() as connection:

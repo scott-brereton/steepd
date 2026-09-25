@@ -156,6 +156,7 @@ FORM_ROUTE_LIMITS = {
             "/account/senders/policy",
             "/account/senders/add",
             "/account/senders/remove",
+            "/account/reader-actions",
         )
     },
     # Every newsletter POST has a fixed path with the ids in the body, so the exact-path
@@ -706,6 +707,8 @@ def _remaining_retention_days(item: Item, retention: timedelta, *, now: datetime
 
 def _item_row(item: Item, *, retention: timedelta | None, now: datetime) -> str:
     meta = f"{item.kind.capitalize()} · {_human_size(item.size_bytes)} · {item.created_at[:10]}"
+    if item.starred_at:
+        meta += " · starred"
     removal_note = ""
     if retention is not None:
         days = _remaining_retention_days(item, retention, now=now)
@@ -1014,6 +1017,25 @@ def _email_verification_section(
     )
 
 
+def _reader_actions_section(tenant: Tenant, *, available: bool) -> str:
+    checked = " checked" if tenant.reader_actions else ""
+    disabled = "" if available else " disabled"
+    availability = "" if available else '<p class="fineprint">This is switched off on Steepd right now.</p>'
+    return (
+        "<section><h2>Star and delete from your reader</h2>"
+        "<p>When this is on, choosing a book or article in your reader's catalogue opens a short menu: "
+        "download it, star it, or delete it from Steepd. Starred items are listed under Starred. "
+        f"Deleted items go to Trash on this site for {_human_days(TRASH_RETENTION.days)}.</p>"
+        '<form method="post" action="/account/reader-actions">'
+        f'<label class="confirm"><input type="checkbox" name="reader_actions" value="yes"{checked}{disabled}> '
+        "Show Star and Delete in my reader</label>"
+        f'<button class="quiet" type="submit"{disabled}>Save</button></form>'
+        '<p class="fineprint">Tested with the CrossPoint firmware. Some other reading apps load links '
+        "before you choose them, which could star or delete items, so leave this off if you use one.</p>"
+        f"{availability}</section>"
+    )
+
+
 def _trash_row(entry: TrashedItem) -> str:
     item = entry.item
     meta = f"{item.kind.capitalize()} · {_human_size(item.size_bytes)} · deleted {_short_date(entry.deleted_at)}"
@@ -1066,6 +1088,7 @@ def _account_page(
     email_verification_available: bool,
     import_panel: str = "",
     trash_count: int = 0,
+    reader_actions_available: bool = True,
     error: str = "",
     status_code: int = status.HTTP_200_OK,
 ) -> HTMLResponse:
@@ -1091,6 +1114,7 @@ def _account_page(
         f"{import_panel}"
         f"{organization}"
         f"{_shelves_section(counts, trash_count=trash_count)}"
+        f"{_reader_actions_section(tenant, available=reader_actions_available)}"
         f"{_senders_section(tenant, senders, refused)}"
         f"{verification}"
         "<section><h2>Device password</h2>"
@@ -2503,6 +2527,7 @@ def build_web_router(
                 settings.max_upload_bytes, field=import_field, error=import_error, url=import_url
             ),
             trash_count=database.trash_summary(scope)[0],
+            reader_actions_available=settings.reader_actions_enabled,
             error=error,
             status_code=status_code,
         )
@@ -2868,6 +2893,12 @@ def build_web_router(
             expires_at=expires_at,
         )
         return _redirect("/account" if armed else "/signin")
+
+    @router.post("/account/reader-actions", dependencies=[SameOrigin])
+    async def set_reader_actions(request: Request, session: SignedIn) -> Response:
+        enabled = (await _form_fields(request)).get("reader_actions", "") == "yes"
+        await run_in_threadpool(database.set_reader_actions, session.tenant.id, enabled)
+        return _redirect("/account")
 
     @router.post("/account/senders/policy", dependencies=[SameOrigin])
     async def set_policy(request: Request, session: SignedIn) -> Response:

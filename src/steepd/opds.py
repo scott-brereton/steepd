@@ -134,7 +134,9 @@ def _add_page_links(
         _link(root, rel="next", href=_absolute(base_url, path, query), media_type=media_type)
 
 
-def build_root_catalog(database: Database, scope: TenantScope, base_url: str, *, probe: bool = False) -> bytes:
+def build_root_catalog(
+    database: Database, scope: TenantScope, base_url: str, *, interactive: bool = False
+) -> bytes:
     show_publications, catalogue_updated_at = database.newsletter_catalogue_state(scope)
     # The newest arrival alone cannot express a rename, a merge, an expiry, or this feed's
     # own Newsletters link changing target, so the catalogue clock is folded in. Both are
@@ -185,108 +187,83 @@ def build_root_catalog(database: Database, scope: TenantScope, base_url: str, *,
         href=_absolute(base_url, "/opds/books"),
         description="Every book in your library",
     )
-    if probe:
+    if interactive:
         _navigation_entry(
             root,
-            entry_id="urn:steepd:probe",
-            title="Action probe",
+            entry_id="urn:steepd:starred",
+            title="Starred",
             updated=updated,
-            href=_absolute(base_url, "/opds/probe"),
-            description="Test item menus. Nothing here changes your library",
+            href=_absolute(base_url, "/opds/starred"),
+            description="Items you starred, most recent first",
             media_type=NAVIGATION_TYPE,
         )
     return _serialize(root)
 
 
-# -- action probe ------------------------------------------------------
-# A throwaway catalogue for finding out, on a real reader, how an item menu behaves: one
-# real download row and two action rows that are ordinary navigation entries. The action
-# routes only log the request and answer with a result feed, so nothing here can change a
-# library. Status goes in entry titles because CrossPoint keeps no entry content, and every
-# feed carries at least one row because it treats an empty feed as an error.
+# -- item menus ----------------------------------------------------------
+# With reader actions on, a shelf lists each item as a navigation entry that opens its
+# menu: the real download plus Star or Unstar and Delete from Steepd. Those two are
+# navigation entries too, so a reader fetches them as feeds and never writes a file for
+# them. Result feeds put their status in entry titles, because CrossPoint keeps no entry
+# content, and always carry a row, because it treats an empty feed as an error.
 
-PROBE_LIST_SIZE = 5
-PROBE_VERBS = {"star": "Star", "trash": "Delete from Steepd"}
-
-
-def build_probe_catalog(database: Database, scope: TenantScope, base_url: str) -> bytes:
-    items = database.list_items(scope, limit=PROBE_LIST_SIZE, offset=0)
-    updated = items[0].created_at if items else database.latest_created_at(scope)
-    root = _feed("urn:steepd:probe", "Action probe", updated)
-    _add_common_links(root, base_url=base_url, self_path="/opds/probe", self_type=NAVIGATION_TYPE, search=False)
-    for item in items:
-        _navigation_entry(
-            root,
-            entry_id=f"urn:steepd:probe:item:{item.id}",
-            title=item.title,
-            updated=item.created_at,
-            href=_absolute(base_url, f"/opds/probe/items/{item.id}"),
-            description="Open this item's menu",
-            media_type=NAVIGATION_TYPE,
-        )
-    if not items:
-        _navigation_entry(
-            root,
-            entry_id="urn:steepd:probe:empty",
-            title="Nothing to test yet. Back to library",
-            updated=updated,
-            href=_absolute(base_url, "/opds"),
-            description="",
-            media_type=NAVIGATION_TYPE,
-        )
-    return _serialize(root)
+ACTION_VERBS = ("star", "unstar", "trash")
 
 
-def build_probe_menu(item: Item, base_url: str) -> bytes:
-    root = _feed(f"urn:steepd:probe:menu:{item.id}", item.title, item.created_at)
+def _item_menu_entry(root: ElementTree.Element, item: Item, base_url: str) -> None:
+    entry = _atom(root, "entry")
+    _atom(entry, "id", f"urn:sha256:{item.sha256}")
+    _atom(entry, "title", item.title)
+    _atom(entry, "updated", item.created_at)
+    if item.author:
+        author = _atom(entry, "author")
+        _atom(author, "name", item.author)
+    _link(entry, rel="subsection", href=_absolute(base_url, f"/opds/items/{item.id}"), media_type=NAVIGATION_TYPE)
+
+
+def _action_url(base_url: str, item: Item, verb: str) -> str:
+    return _absolute(base_url, f"/opds/items/{item.id}/{verb}", {"rev": item.revision})
+
+
+def build_item_menu(item: Item, base_url: str) -> bytes:
+    root = _feed(f"urn:steepd:item:{item.id}", item.title, item.created_at)
     _add_common_links(
-        root, base_url=base_url, self_path=f"/opds/probe/items/{item.id}", self_type=NAVIGATION_TYPE, search=False
+        root, base_url=base_url, self_path=f"/opds/items/{item.id}", self_type=NAVIGATION_TYPE, search=False
     )
     # The download row keeps the item's own title and author: CrossPoint names the local
     # file after them, so a row titled "Download" would save Download.epub.
     _acquisition_entry(root, item, base_url)
-    for verb, label in PROBE_VERBS.items():
+    star_verb, star_label = ("unstar", "Unstar") if item.starred_at else ("star", "Star")
+    for verb, label in ((star_verb, star_label), ("trash", "Delete from Steepd")):
         _navigation_entry(
             root,
-            entry_id=f"urn:steepd:probe:{verb}:{item.id}",
+            entry_id=f"urn:steepd:item:{item.id}:{verb}",
             title=label,
             updated=item.created_at,
-            href=_absolute(base_url, f"/opds/probe/actions/{item.id}/{verb}"),
+            href=_action_url(base_url, item, verb),
             description="",
             media_type=NAVIGATION_TYPE,
         )
     return _serialize(root)
 
 
-def build_probe_result(item: Item, verb: str, hit: int, base_url: str) -> bytes:
-    root = _feed(f"urn:steepd:probe:result:{item.id}:{verb}", PROBE_VERBS[verb], item.created_at)
-    _add_common_links(
-        root,
-        base_url=base_url,
-        self_path=f"/opds/probe/actions/{item.id}/{verb}",
-        self_type=NAVIGATION_TYPE,
-        search=False,
-    )
-    # The hit count is in the title so a repeat request -- Back, a reconnect -- shows up
-    # on the device as well as in the log.
-    _navigation_entry(
-        root,
-        entry_id=f"urn:steepd:probe:return:{item.id}",
-        title=f"{PROBE_VERBS[verb]} request #{hit} logged. Nothing changed. Return to item",
-        updated=item.created_at,
-        href=_absolute(base_url, f"/opds/probe/items/{item.id}"),
-        description="",
-        media_type=NAVIGATION_TYPE,
-    )
-    _navigation_entry(
-        root,
-        entry_id="urn:steepd:probe:library",
-        title="Back to library",
-        updated=item.created_at,
-        href=_absolute(base_url, "/opds"),
-        description="",
-        media_type=NAVIGATION_TYPE,
-    )
+def build_result_feed(
+    base_url: str, *, feed_id: str, title: str, updated: str, rows: list[tuple[str, str]]
+) -> bytes:
+    """A feed of navigation rows, each a (title, path) pair. The first row carries the
+    outcome; Back to library is appended to every result."""
+    root = _feed(f"urn:steepd:result:{feed_id}", title, updated)
+    _add_common_links(root, base_url=base_url, self_path="/opds", self_type=NAVIGATION_TYPE, search=False)
+    for index, (row_title, path) in enumerate([*rows, ("Back to library", "/opds")]):
+        _navigation_entry(
+            root,
+            entry_id=f"urn:steepd:result:{feed_id}:{index}",
+            title=row_title,
+            updated=updated,
+            href=_absolute(base_url, path),
+            description="",
+            media_type=NAVIGATION_TYPE,
+        )
     return _serialize(root)
 
 
@@ -303,18 +280,24 @@ def build_items_catalog(
     source: str | None = None,
     publication: str | None = None,
     site: str | None = None,
+    starred: bool = False,
     page: int = 1,
     self_path: str | None = None,
     updated_floor: str | None = None,
+    interactive: bool = False,
 ) -> bytes:
     # self_path is overridable so a feed reached through a merged publication's old URL
     # advertises the URL that was actually requested. Answering there directly is what
     # lets an old bookmark keep working without relying on the reader to follow a redirect.
     self_path = self_path or f"/opds/{feed_id}"
     offset = (page - 1) * PAGE_SIZE
-    filters = dict(kind=kind, author=author, query=query, source=source, publication=publication, site=site)
+    filters = dict(
+        kind=kind, author=author, query=query, source=source, publication=publication, site=site, starred=starred
+    )
     total = database.count_items(scope, **filters)
-    items = database.list_items(scope, **filters, limit=PAGE_SIZE, offset=offset)
+    items = database.list_items(
+        scope, **filters, limit=PAGE_SIZE, offset=offset, order="starred" if starred else "newest"
+    )
     updated = items[0].created_at if items else database.latest_created_at(scope)
     # A rename moves a publication's feed without changing any issue's arrival date.
     updated = max(updated, updated_floor or "")
@@ -332,7 +315,10 @@ def build_items_catalog(
         extra_query=page_query,
     )
     for item in items:
-        _acquisition_entry(root, item, base_url)
+        if interactive:
+            _item_menu_entry(root, item, base_url)
+        else:
+            _acquisition_entry(root, item, base_url)
     return _serialize(root)
 
 
@@ -434,7 +420,13 @@ def build_publications_catalog(database: Database, scope: TenantScope, base_url:
 
 
 def build_publication_catalog(
-    database: Database, scope: TenantScope, base_url: str, *, publication_id: str, page: int = 1
+    database: Database,
+    scope: TenantScope,
+    base_url: str,
+    *,
+    publication_id: str,
+    page: int = 1,
+    interactive: bool = False,
 ) -> bytes | None:
     """One publication's issues, or None when this tenant has no such publication.
 
@@ -457,6 +449,7 @@ def build_publication_catalog(
         page=page,
         self_path=f"/opds/publications/{publication_id}",
         updated_floor=publication.updated_at,
+        interactive=interactive,
     )
 
 
@@ -495,7 +488,9 @@ def build_sites_catalog(database: Database, scope: TenantScope, base_url: str, *
     return _serialize(root)
 
 
-def build_site_catalog(database: Database, scope: TenantScope, base_url: str, *, host: str, page: int = 1) -> bytes:
+def build_site_catalog(
+    database: Database, scope: TenantScope, base_url: str, *, host: str, page: int = 1, interactive: bool = False
+) -> bytes:
     """One site's saved pages. A host with none gives an empty feed, as an author does.
 
     An empty feed rather than a 404 keeps a bookmark usable after the last page from that
@@ -511,4 +506,5 @@ def build_site_catalog(database: Database, scope: TenantScope, base_url: str, *,
         source="url",
         site=host,
         page=page,
+        interactive=interactive,
     )

@@ -13,6 +13,7 @@ import hashlib
 import html
 import re
 import xml.etree.ElementTree as ElementTree
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -576,7 +577,7 @@ def test_delete_moves_an_item_to_trash_where_it_can_be_restored(web):
 
     response = client.post(f"/account/trash/{item.id}/restore", follow_redirects=False)
     assert response.headers["location"] == "/account/trash?notice=restored"
-    assert database.get_item(scope, item.id) == item
+    assert database.get_item(scope, item.id) == replace(item, revision=2)
     assert "A stored book" in client.get("/account/library").text
     assert 'href="/account/trash"' not in client.get("/account").text
 

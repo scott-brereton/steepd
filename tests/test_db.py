@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -152,15 +153,24 @@ def test_a_populated_version_7_database_gains_the_trash_table_and_keeps_its_libr
     tenant = database.create_tenant(email="ada@example.com", inbox_local="ada")
     item = _item("i1", tenant.id, title="Book", source="email")
     database.insert_item(TenantScope(tenant.id), item)
+    # Back to the v7 shape: no trash table, and none of the reader-action columns.
     with database._connect() as connection:
         connection.execute("DROP TABLE trashed_items")
+        connection.execute("DROP INDEX items_tenant_starred_idx")
+        for table, column in (("items", "starred_at"), ("items", "revision"), ("tenants", "reader_actions")):
+            connection.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
         connection.execute("PRAGMA user_version = 7")
 
     database.initialize()
+    database.initialize()  # idempotent
 
     assert _version(database) == 8
-    assert database.get_item(TenantScope(tenant.id), "i1") == item
-    assert database.trash_summary(TenantScope(tenant.id)) == (0, 0)
+    scope = TenantScope(tenant.id)
+    assert database.get_item(scope, "i1") == item
+    assert database.tenant_by_id(tenant.id).reader_actions is False
+    assert database.trash_summary(scope) == (0, 0)
+    assert database.set_starred(scope, "i1", starred=True, expected_revision=0, now=STAMP)
+    assert database.get_item(scope, "i1").revision == 1
 
 
 def test_an_interrupted_additive_upgrade_finishes_on_the_next_start(tmp_path, monkeypatch):
@@ -1072,11 +1082,12 @@ def test_a_trashed_item_leaves_every_item_query_and_restores_unchanged(database)
     assert database.count_items(scope) == 0
     assert database.list_authors(scope) == []
     assert database.item_by_sha256(scope, item.sha256) is None
-    assert database.get_trashed_item(scope, "i1").item == item
+    # Each move advances the revision, so a reader request made before it no longer applies.
+    assert database.get_trashed_item(scope, "i1").item == replace(item, revision=1)
     assert database.trash_summary(scope) == (1, item.size_bytes)
     assert database.tenant_storage_bytes(scope) == item.size_bytes
 
-    assert database.restore_item(scope, "i1", now=STAMP) == item
+    assert database.restore_item(scope, "i1", now=STAMP) == replace(item, revision=2)
     assert database.get_trashed_item(scope, "i1") is None
     assert database.trash_summary(scope) == (0, 0)
 

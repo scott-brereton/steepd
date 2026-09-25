@@ -279,10 +279,13 @@ class ItemStorage:
             self._fsync_directory(self._tenant_dir(item.tenant_id))
             return True
 
-    def trash(self, scope: TenantScope, item_id: str) -> bool:
+    def trash(self, scope: TenantScope, item_id: str, *, expected_revision: int | None = None) -> bool:
         """Move an item to the trash. The file stays where it is until purge()."""
         with self._lock:
-            return self.database.trash_item(scope, item_id, now=datetime.now(UTC).isoformat()) is not None
+            moved = self.database.trash_item(
+                scope, item_id, now=datetime.now(UTC).isoformat(), expected_revision=expected_revision
+            )
+            return moved is not None
 
     def restore(self, scope: TenantScope, item_id: str) -> bool:
         """Put a trashed item back in the library.

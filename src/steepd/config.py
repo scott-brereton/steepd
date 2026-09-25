@@ -178,10 +178,10 @@ class Settings:
     # Confirm against the chosen endpoint with ops/evaluate_publications.py smoke: some
     # reject a request that tries to switch reasoning off, and reasoning is billed output.
     newsletter_ai_reasoning: str = "exclude"
-    # OPDS usernames that see the reader action probe: a throwaway catalogue for checking
-    # on a real device how item menus and Star/Delete rows behave. Its actions only log;
-    # nothing in the library changes. Empty, the default, hides it from everyone.
-    opds_probe_usernames: tuple[str, ...] = ()
+    # Star and Delete in the reader catalogue. Each account still has to turn them on; this
+    # switch turns them off for everyone at once, and refuses their requests, not only
+    # their links, so an old menu on a reader cannot act while it is off.
+    reader_actions_enabled: bool = True
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -252,5 +252,6 @@ class Settings:
             newsletter_ai_max_input_price=_positive_float("NEWSLETTER_AI_MAX_INPUT_PRICE", 0.10, maximum=1_000.0),
             newsletter_ai_max_output_price=_positive_float("NEWSLETTER_AI_MAX_OUTPUT_PRICE", 0.40, maximum=1_000.0),
             newsletter_ai_reasoning=_reasoning_mode("NEWSLETTER_AI_REASONING"),
-            opds_probe_usernames=_name_tuple("OPDS_PROBE_USERNAMES"),
+            reader_actions_enabled=os.getenv("READER_ACTIONS_ENABLED", "true").strip().lower()
+            not in ("0", "false", "no", "off"),
         )

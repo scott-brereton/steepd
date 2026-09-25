@@ -20,6 +20,9 @@ class Tenant:
     inbox_confirmed_at: str | None = None
     # "anyone" or "listed". Anything else reads as "anyone".
     sender_policy: str = "anyone"
+    # Whether the reader catalogue opens an item menu with Star and Delete instead of
+    # offering each item as a direct download. Off until the owner turns it on.
+    reader_actions: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +49,10 @@ class Item:
     created_at: str
     expires_at: str | None
     source: str
+    starred_at: str | None = None
+    # Advanced by every star, unstar, trash and restore. A reader action carries the
+    # revision its menu showed, so a request replayed later cannot undo a newer change.
+    revision: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)

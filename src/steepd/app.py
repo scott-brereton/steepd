@@ -5,8 +5,8 @@
 # every scoped route silently degrades into one expecting a query parameter (422).
 import hmac
 import logging
-from collections import Counter
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
@@ -29,20 +29,19 @@ from steepd.inbound import (
     ResendInboundProvider,
 )
 from steepd.middleware import BodySizeLimitMiddleware, SecurityHeadersMiddleware
-from steepd.models import Item
+from steepd.models import Tenant
 from steepd.newsletter import NewsletterForwardingError
 from steepd.opds import (
     ACQUISITION_TYPE,
+    ACTION_VERBS,
     NAVIGATION_TYPE,
-    PROBE_VERBS,
     author_from_token,
     build_authors_catalog,
+    build_item_menu,
     build_items_catalog,
-    build_probe_catalog,
-    build_probe_menu,
-    build_probe_result,
     build_publication_catalog,
     build_publications_catalog,
+    build_result_feed,
     build_root_catalog,
     build_site_catalog,
     build_sites_catalog,
@@ -51,7 +50,7 @@ from steepd.publications import Organizer, build_classifier, start_organizer_thr
 from steepd.ratelimit import RateLimiter, RateLimitMiddleware
 from steepd.retention import start_retention_thread
 from steepd.stats import render_stats
-from steepd.storage import ItemStorage
+from steepd.storage import TRASH_RETENTION, ItemStorage
 from steepd.tenancy import TenantScope
 from steepd.web import (
     FORM_ROUTE_LIMITS,
@@ -175,49 +174,35 @@ def create_app(
 
     basic = HTTPBasic(auto_error=False)
 
-    def device_scope(credentials: Annotated[HTTPBasicCredentials | None, Depends(basic)]) -> TenantScope:
-        """Resolve HTTP Basic credentials to the one scope every OPDS route reads through."""
+    def device_tenant(credentials: Annotated[HTTPBasicCredentials | None, Depends(basic)]) -> Tenant:
+        """Resolve HTTP Basic credentials to the tenant every OPDS route reads through."""
         if credentials is None:
             raise _unauthorized()
         tenant = authenticate_device(database, credentials.username, credentials.password)
         if tenant is None:
             raise _unauthorized()
+        return tenant
+
+    DeviceTenant = Annotated[Tenant, Depends(device_tenant)]
+
+    def device_scope(tenant: DeviceTenant) -> TenantScope:
         return TenantScope(tenant.id)
 
     # Named once so every OPDS route below takes the same scope the same way. There is no
-    # route that reads items without one.
+    # route that reads items without one. FastAPI resolves device_tenant once per request,
+    # so a route taking both pays for one password check.
     DeviceScope = Annotated[TenantScope, Depends(device_scope)]
     Page = Annotated[int, Query(ge=1)]
 
-    def probe_allowed(credentials: Annotated[HTTPBasicCredentials | None, Depends(basic)]) -> bool:
-        # Only meaningful next to DeviceScope, which has already checked the password.
-        return credentials is not None and credentials.username in settings.opds_probe_usernames
+    def reader_actions_on(tenant: DeviceTenant) -> bool:
+        return settings.reader_actions_enabled and tenant.reader_actions
 
-    def probe_scope(scope: DeviceScope, allowed: Annotated[bool, Depends(probe_allowed)]) -> TenantScope:
-        if not allowed:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
-        return scope
+    # Whether shelves list items as menus (steepd.opds) rather than direct downloads.
+    Interactive = Annotated[bool, Depends(reader_actions_on)]
 
-    ProbeScope = Annotated[TenantScope, Depends(probe_scope)]
-    # Counts per process, which is all the probe needs: a repeat shows up as #2.
-    probe_hits: Counter[tuple[str, str, str]] = Counter()
-
-    def _probe_item(scope: TenantScope, item_id: str, request: Request, what: str) -> Item:
-        item = database.get_item(scope, item_id)
-        LOGGER.info(
-            "OPDS probe %s: tenant=%s item=%s found=%s ua=%r range=%r",
-            what,
-            scope.tenant_id,
-            item_id,
-            item is not None,
-            request.headers.get("user-agent", ""),
-            request.headers.get("range", ""),
-        )
-        if item is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Item not found")
-        return item
-
-    def _items_feed(scope: TenantScope, *, title: str, feed_id: str, page: int, **filters: str | None) -> Response:
+    def _items_feed(
+        scope: TenantScope, *, title: str, feed_id: str, page: int, interactive: bool, **filters: str | bool | None
+    ) -> Response:
         return _xml_response(
             build_items_catalog(
                 database,
@@ -226,6 +211,7 @@ def create_app(
                 title=title,
                 feed_id=feed_id,
                 page=page,
+                interactive=interactive,
                 **filters,
             ),
             ACQUISITION_TYPE,
@@ -265,19 +251,25 @@ def create_app(
 
     @app.get("/opds")
     @app.get("/opds/", include_in_schema=False)
-    def opds_root(scope: DeviceScope, probe: Annotated[bool, Depends(probe_allowed)]) -> Response:
+    def opds_root(scope: DeviceScope, interactive: Interactive) -> Response:
         return _xml_response(
-            build_root_catalog(database, scope, settings.public_base_url, probe=probe), NAVIGATION_TYPE
+            build_root_catalog(database, scope, settings.public_base_url, interactive=interactive), NAVIGATION_TYPE
         )
 
     @app.get("/opds/recent")
-    def opds_recent(scope: DeviceScope, page: Page = 1) -> Response:
-        return _items_feed(scope, title="Recent", feed_id="recent", page=page)
+    def opds_recent(scope: DeviceScope, interactive: Interactive, page: Page = 1) -> Response:
+        return _items_feed(scope, title="Recent", feed_id="recent", page=page, interactive=interactive)
 
     @app.get("/opds/newsletters")
-    def opds_newsletters(scope: DeviceScope, page: Page = 1) -> Response:
+    def opds_newsletters(scope: DeviceScope, interactive: Interactive, page: Page = 1) -> Response:
         return _items_feed(
-            scope, title="Newsletters", feed_id="newsletters", page=page, kind="article", source="newsletter"
+            scope,
+            title="Newsletters",
+            feed_id="newsletters",
+            page=page,
+            interactive=interactive,
+            kind="article",
+            source="newsletter",
         )
 
     @app.get("/opds/publications")
@@ -288,9 +280,16 @@ def create_app(
         )
 
     @app.get("/opds/publications/{publication_id}")
-    def opds_publication(scope: DeviceScope, publication_id: str, page: Page = 1) -> Response:
+    def opds_publication(
+        scope: DeviceScope, interactive: Interactive, publication_id: str, page: Page = 1
+    ) -> Response:
         feed = build_publication_catalog(
-            database, scope, settings.public_base_url, publication_id=publication_id, page=page
+            database,
+            scope,
+            settings.public_base_url,
+            publication_id=publication_id,
+            page=page,
+            interactive=interactive,
         )
         if feed is None:
             # Another tenant's id and one that never existed answer identically, so a feed
@@ -299,8 +298,10 @@ def create_app(
         return _xml_response(feed, ACQUISITION_TYPE)
 
     @app.get("/opds/saved")
-    def opds_saved(scope: DeviceScope, page: Page = 1) -> Response:
-        return _items_feed(scope, title="Saved", feed_id="saved", page=page, kind="article", source="url")
+    def opds_saved(scope: DeviceScope, interactive: Interactive, page: Page = 1) -> Response:
+        return _items_feed(
+            scope, title="Saved", feed_id="saved", page=page, interactive=interactive, kind="article", source="url"
+        )
 
     @app.get("/opds/sites")
     def opds_sites(scope: DeviceScope, page: Page = 1) -> Response:
@@ -309,24 +310,34 @@ def create_app(
         )
 
     @app.get("/opds/sites/{host}")
-    def opds_site(scope: DeviceScope, host: str, page: Page = 1) -> Response:
+    def opds_site(scope: DeviceScope, interactive: Interactive, host: str, page: Page = 1) -> Response:
         if not is_site_host(host):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such site")
         return _xml_response(
-            build_site_catalog(database, scope, settings.public_base_url, host=host, page=page), ACQUISITION_TYPE
+            build_site_catalog(
+                database, scope, settings.public_base_url, host=host, page=page, interactive=interactive
+            ),
+            ACQUISITION_TYPE,
         )
 
     @app.get("/opds/books")
-    def opds_books(scope: DeviceScope, page: Page = 1) -> Response:
-        return _items_feed(scope, title="Books", feed_id="books", page=page, kind="book")
+    def opds_books(scope: DeviceScope, interactive: Interactive, page: Page = 1) -> Response:
+        return _items_feed(scope, title="Books", feed_id="books", page=page, interactive=interactive, kind="book")
+
+    @app.get("/opds/starred")
+    def opds_starred(scope: DeviceScope, interactive: Interactive, page: Page = 1) -> Response:
+        return _items_feed(scope, title="Starred", feed_id="starred", page=page, interactive=interactive, starred=True)
 
     @app.get("/opds/search")
     def opds_search(
         scope: DeviceScope,
+        interactive: Interactive,
         q: Annotated[str, Query(min_length=1, max_length=160)],
         page: Page = 1,
     ) -> Response:
-        return _items_feed(scope, title=f"Search: {q}", feed_id="search", page=page, query=q)
+        return _items_feed(
+            scope, title=f"Search: {q}", feed_id="search", page=page, interactive=interactive, query=q
+        )
 
     @app.get("/opds/authors")
     def opds_authors(scope: DeviceScope, page: Page = 1) -> Response:
@@ -336,14 +347,16 @@ def create_app(
         )
 
     @app.get("/opds/authors/{token}")
-    def opds_author(token: str, scope: DeviceScope, page: Page = 1) -> Response:
+    def opds_author(token: str, scope: DeviceScope, interactive: Interactive, page: Page = 1) -> Response:
         try:
             author = author_from_token(token)
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Author not found") from exc
         # feed_id carries the token, not the plain name: self/previous/next are derived as
         # /opds/{feed_id}, so anything else would point pagination at a path with no route.
-        return _items_feed(scope, title=author, feed_id=f"authors/{token}", page=page, author=author)
+        return _items_feed(
+            scope, title=author, feed_id=f"authors/{token}", page=page, interactive=interactive, author=author
+        )
 
     @app.get("/opds/download/{item_id}.epub")
     def opds_download(item_id: str, scope: DeviceScope) -> FileResponse:
@@ -361,25 +374,93 @@ def create_app(
         response.headers["Cache-Control"] = "private, no-store"
         return response
 
-    @app.get("/opds/probe")
-    def opds_probe(scope: ProbeScope, request: Request) -> Response:
-        LOGGER.info("OPDS probe list: tenant=%s ua=%r", scope.tenant_id, request.headers.get("user-agent", ""))
-        return _xml_response(build_probe_catalog(database, scope, settings.public_base_url), NAVIGATION_TYPE)
+    # -- reader actions --------------------------------------------------
+    # Star, Unstar and Delete from Steepd are GET requests, because a reader can only follow
+    # links. What makes that acceptable: they exist only for accounts that turned them on;
+    # each sets a value rather than toggling one; each carries the revision its menu showed,
+    # so a request replayed by Back after a later change does nothing; and Delete only moves
+    # the item to Trash. A browser sending one cross-site is refused outright.
 
-    @app.get("/opds/probe/items/{item_id}")
-    def opds_probe_menu(item_id: str, scope: ProbeScope, request: Request) -> Response:
-        item = _probe_item(scope, item_id, request, "menu")
-        return _xml_response(build_probe_menu(item, settings.public_base_url), NAVIGATION_TYPE)
-
-    @app.get("/opds/probe/actions/{item_id}/{verb}")
-    def opds_probe_action(item_id: str, verb: str, scope: ProbeScope, request: Request) -> Response:
-        if verb not in PROBE_VERBS:
+    def _actions_allowed(tenant: Tenant, request: Request) -> None:
+        # 404 rather than 403 when off, so the routes look absent, and so a menu left open
+        # on a reader cannot act after the owner or the operator turns them off.
+        if not reader_actions_on(tenant):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
-        item = _probe_item(scope, item_id, request, f"action {verb}")
-        probe_hits[(scope.tenant_id, item.id, verb)] += 1
-        hit = probe_hits[(scope.tenant_id, item.id, verb)]
-        LOGGER.info("OPDS probe action %s hit #%d: tenant=%s item=%s", verb, hit, scope.tenant_id, item.id)
-        return _xml_response(build_probe_result(item, verb, hit, settings.public_base_url), NAVIGATION_TYPE)
+        if request.headers.get("sec-fetch-site", "") in ("cross-site", "same-site"):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cross-site request refused")
+
+    def _result(feed_id: str, title: str, rows: list[tuple[str, str]]) -> Response:
+        return _xml_response(
+            build_result_feed(
+                settings.public_base_url,
+                feed_id=feed_id,
+                title=title,
+                updated=datetime.now(UTC).isoformat(),
+                rows=rows,
+            ),
+            NAVIGATION_TYPE,
+        )
+
+    trashed_row = (
+        f"Deleted from Steepd. You can restore it on the website for {TRASH_RETENTION.days} days",
+        "/opds",
+    )
+
+    @app.get("/opds/items/{item_id}")
+    def opds_item(item_id: str, tenant: DeviceTenant, request: Request) -> Response:
+        _actions_allowed(tenant, request)
+        scope = TenantScope(tenant.id)
+        item = database.get_item(scope, item_id)
+        if item is not None:
+            return _xml_response(build_item_menu(item, settings.public_base_url), NAVIGATION_TYPE)
+        # Back from a Delete result lands here, so a trashed item gets a readable answer.
+        if database.get_trashed_item(scope, item_id) is not None:
+            return _result(f"{item_id}:trashed", "Deleted", [trashed_row])
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Item not found")
+
+    @app.get("/opds/items/{item_id}/{verb}")
+    def opds_item_action(
+        item_id: str, verb: str, tenant: DeviceTenant, request: Request, rev: Annotated[int, Query(ge=0)]
+    ) -> Response:
+        _actions_allowed(tenant, request)
+        if verb not in ACTION_VERBS:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+        scope = TenantScope(tenant.id)
+        item_path = f"/opds/items/{item_id}"
+        feed_id = f"{item_id}:{verb}"
+        item = database.get_item(scope, item_id)
+        if item is None:
+            if database.get_trashed_item(scope, item_id) is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Item not found")
+            if verb == "trash":
+                return _result(feed_id, "Deleted", [trashed_row])
+            gone = ("Nothing changed. This item was deleted from Steepd", "/opds")
+            return _result(feed_id, "Nothing changed", [gone])
+
+        changed = _result(
+            feed_id,
+            "Nothing changed",
+            [("Nothing changed. This item changed since you opened it. Reopen it", item_path)],
+        )
+        if verb == "trash":
+            if item.revision == rev and storage.trash(scope, item_id, expected_revision=rev):
+                LOGGER.info("Reader action trash: tenant=%s item=%s", tenant.id, item_id)
+                return _result(feed_id, "Deleted", [trashed_row])
+            return changed
+
+        starred = verb == "star"
+        label = "Starred" if starred else "Unstarred"
+        done = _result(feed_id, label, [(f"{label}. Back to this item", item_path)])
+        if (item.starred_at is not None) == starred and item.revision != rev:
+            # Already so: most often Back fetching this same link again after it worked.
+            return done
+        now = datetime.now(UTC).isoformat()
+        if item.revision == rev and database.set_starred(
+            scope, item_id, starred=starred, expected_revision=rev, now=now
+        ):
+            LOGGER.info("Reader action %s: tenant=%s item=%s", verb, tenant.id, item_id)
+            return done
+        return changed
 
     # -- inbound email ---------------------------------------------------
 
