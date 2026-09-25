@@ -514,10 +514,7 @@ def test_configured_plan_limits_stay_consistent_and_isolated_between_apps(tmp_pa
             landing = public.get("/", headers={"Accept": accept})
             assert landing.status_code == 200
             assert landing.headers["content-type"].startswith(accept)
-            assert f"{free_mb} MB" in landing.text
-            assert f"{paid_gb} GB" in landing.text
-            assert f"Kept {period}" in landing.text
-            assert "Kept until deleted" in landing.text
+            assert f"Free for now: {free_mb} MB of storage, and each item is kept for {period}." in landing.text
             for path in ("/privacy", "/terms"):
                 page = public.get(path, headers={"Accept": accept})
                 assert page.status_code == 200
@@ -1065,19 +1062,20 @@ def test_the_landing_diagram_shows_all_three_email_inputs_and_saved(web):
 
 
 def test_the_landing_pricing_quotes_the_app_settings(web):
-    """The free card describes the live product, so its numbers have to be the ones the
+    """The pricing line describes the live product, so its numbers have to be the ones the
     quota and the retention sweep actually enforce. Both expectations are computed from
     the app settings here: a page that hardcoded "100 MB" or "7 days" would keep saying so
     after the plan changed, and the first person to notice would be a user at their limit.
     """
     client, _ = web
+    settings = client.app.state.settings
     body = client.get("/").text
 
-    assert _human_size(client.app.state.settings.free_quota_bytes) in body
-    assert f"Kept {client.app.state.settings.free_retention.days} days" in body
-    assert _human_size(client.app.state.settings.paid_quota_bytes) in body
-    assert body.count("coming soon") == 1
-    assert "Paid plans arrive after the beta" in body
+    assert (
+        f"Free for now: {_human_size(settings.free_quota_bytes)} of storage, and each item is kept for "
+        f"{settings.free_retention.days} days."
+    ) in body
+    assert "coming soon" not in body
 
 
 def test_the_beta_chip_is_on_the_signed_in_pages_too(web):

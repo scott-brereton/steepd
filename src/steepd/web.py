@@ -361,14 +361,6 @@ letter-spacing:.06em;background:var(--chamomile);color:#4A3418;border-radius:999
 .muted{color:var(--muted)}
 .diagram{margin:52px 0 0}
 .diagram svg{width:100%;height:auto;display:block}
-.tiers{display:flex;gap:12px;flex-wrap:wrap}
-.tier{flex:1 1 170px;background:var(--card);border:1px solid var(--rule);border-radius:12px;padding:20px}
-.tier.live{border-color:var(--umber);border-width:1.5px}
-.tier.soon{opacity:.55}
-.amt{font:700 28px/1.1 ui-rounded,-apple-system,system-ui,sans-serif;color:var(--umber);display:block}
-.per{font-size:14px;color:var(--muted);display:block;margin:3px 0 10px}
-.tier ul{list-style:none;padding:0;margin:0;font-size:15px;color:#544F48}
-.tier li{padding:2px 0}
 .check{margin:20px 0 16px}
 .check p{margin:0 0 8px;padding:12px 16px;background:var(--card);border:1px solid var(--rule);
 border-radius:10px;font-size:15px;color:#544F48}
@@ -1394,24 +1386,6 @@ def _footer(source_url: str) -> str:
     )
 
 
-def _tiers(settings: Settings) -> str:
-    """Three cards, only one of which is buyable.
-
-    The paid two are shown muted and without a button on purpose: the beta is a demand
-    test, and a price with no way to pay it is only honest if the page says so.
-    """
-    return (
-        '<div class="tiers">'
-        '<div class="tier live"><span class="amt">Free</span>'
-        '<span class="per">what you get today</span>'
-        f"<ul><li>{_free_quota(settings)}</li><li>Kept {_human_days(settings.free_retention.days)}</li></ul></div>"
-        '<div class="tier soon"><span class="amt">$5</span><span class="per">per month</span>'
-        f"<ul><li>{_human_size(quota_bytes(PAID_PLAN, settings=settings))}</li><li>Kept until deleted</li>"
-        '<li class="muted">coming soon</li></ul></div>'
-        "</div>"
-    )
-
-
 def _landing_page(settings: Settings) -> HTMLResponse:
     source_url = settings.source_repository_url
     signup = _email_form("/signup", LANDING_SUBMIT_LABEL, "")
@@ -1447,9 +1421,9 @@ def _landing_page(settings: Settings) -> HTMLResponse:
         "one shelf for each. This is off until you turn it on. When it is on, the text of each "
         "newsletter is sent to a model provider to identify the publication, and you can correct "
         "anything it gets wrong. Saved webpages are grouped by the site they came from.</p></section>"
-        f"<section><h2>Pricing</h2>{_tiers(settings)}"
-        '<p class="small muted">Paid plans arrive after the beta. Libraries built during the beta '
-        "carry over.</p></section>"
+        "<section><h2>Pricing</h2>"
+        f'<p class="small">Free for now: {_free_quota(settings)} of storage, and each item is kept for '
+        f"{_human_days(settings.free_retention.days)}.</p></section>"
         "<section><h2>Will it work on mine?</h2>"
         '<p class="small">Steepd is an <strong>OPDS catalogue</strong> — a standard most '
         "e&#8209;readers already speak. Think of it as an RSS feed for books: your reader browses "

@@ -56,8 +56,8 @@ source for it, under the AGPL, so you can also run your own.
 
 ## The hosted service
 
-steepd.app is in open beta and free while it is: 100 MB of storage, with items kept
-60 days. There is no paid plan yet. It is a one-person
+steepd.app is in open beta and free for now: 100 MB of storage, with items kept
+90 days. There is no paid plan yet. It is a one-person
 project; there is no support desk, and no promise about uptime or data retention beyond
 what the terms page says.
 
@@ -191,7 +191,7 @@ Plan limits are optional environment variables, read once at startup:
 | `PAID_QUOTA_BYTES` | `5368709120` (5 GiB) | Storage per paid account. |
 | `FREE_RETENTION_DAYS` | `7` | Whole days a free item is kept, measured from its original arrival. |
 
-The hosted service sets `FREE_QUOTA_BYTES=104857600` and `FREE_RETENTION_DAYS=60`.
+The hosted service sets `FREE_QUOTA_BYTES=104857600` and `FREE_RETENTION_DAYS=90`.
 The table above lists the defaults for an installation with these variables unset.
 
 Unset variables use these defaults. Values must be positive integers; surrounding
