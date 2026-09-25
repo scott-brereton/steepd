@@ -52,6 +52,14 @@ class Item:
 
 
 @dataclass(frozen=True, slots=True)
+class TrashedItem:
+    """An item in the trash, and when it was put there."""
+
+    item: Item
+    deleted_at: str
+
+
+@dataclass(frozen=True, slots=True)
 class AuthorSummary:
     name: str
     item_count: int

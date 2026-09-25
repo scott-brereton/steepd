@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 from steepd.auth import _utc
 from steepd.db import Database
 from steepd.plans import KNOWN_PLANS, retention_for
-from steepd.storage import ItemStorage
+from steepd.storage import TRASH_RETENTION, ItemStorage
 from steepd.tenancy import TenantScope
 
 LOGGER = logging.getLogger("steepd.retention")
@@ -45,6 +45,7 @@ class SweepResult:
     webhook_events_pruned: int = 0
     pending_tenants_deleted: int = 0
     refused_senders_pruned: int = 0
+    trash_purged: int = 0
 
 
 def run_sweep(database: Database, storage: ItemStorage, *, now: datetime | None = None) -> SweepResult:
@@ -75,8 +76,25 @@ def run_sweep(database: Database, storage: ItemStorage, *, now: datetime | None 
             if not progressed:
                 break
 
+    # Trashed items are not in items, so the loop above never sees them: a deleted item
+    # always gets its full TRASH_RETENTION, however old it was. Same paging as above.
+    trash_purged = 0
+    trash_cutoff = (moment - TRASH_RETENTION).isoformat()
+    while True:
+        progressed = False
+        for entry in database.list_trash_past_retention(cutoff=trash_cutoff):
+            try:
+                if storage.purge(TenantScope(entry.item.tenant_id), entry.item.id):
+                    trash_purged += 1
+                    progressed = True
+            except Exception:
+                LOGGER.exception("Retention could not purge trashed item id=%s", entry.item.id)
+        if not progressed:
+            break
+
     return SweepResult(
         items_deleted=items_deleted,
+        trash_purged=trash_purged,
         sessions_pruned=database.delete_expired_sessions(now=stamp),
         magic_tokens_pruned=database.prune_magic_tokens(now=stamp),
         webhook_events_pruned=database.prune_webhook_events(before=(moment - WEBHOOK_EVENT_RETENTION).isoformat()),
@@ -110,6 +128,7 @@ def start_retention_thread(
                 if any(
                     (
                         result.items_deleted,
+                        result.trash_purged,
                         result.sessions_pruned,
                         result.magic_tokens_pruned,
                         result.webhook_events_pruned,
@@ -118,9 +137,10 @@ def start_retention_thread(
                     )
                 ):
                     LOGGER.info(
-                        "Retention swept items=%d sessions=%d magic_tokens=%d webhook_events=%d "
+                        "Retention swept items=%d trash=%d sessions=%d magic_tokens=%d webhook_events=%d "
                         "pending_tenants=%d refused_senders=%d",
                         result.items_deleted,
+                        result.trash_purged,
                         result.sessions_pruned,
                         result.magic_tokens_pruned,
                         result.webhook_events_pruned,

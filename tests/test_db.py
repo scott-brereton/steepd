@@ -57,14 +57,15 @@ def _build_version_4_database(path):
     return Database(path)
 
 
-def test_fresh_database_is_version_7_with_every_table(database):
-    assert _version(database) == SCHEMA_VERSION == 7
+def test_fresh_database_is_version_8_with_every_table(database):
+    assert _version(database) == SCHEMA_VERSION == 8
     with database._connect() as connection:
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(tenants)")}
         tables = {row["name"] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"inbox_confirmed_at", "sender_policy"} <= columns
     assert {"allowed_senders", "refused_senders", "retired_inbox_locals", "email_verification_relays"} <= tables
     assert {"newsletter_preferences", "publications", "newsletter_organization"} <= tables
+    assert "trashed_items" in tables
 
 
 def test_a_version_4_database_upgrades_in_place_and_existing_tenants_are_confirmed(tmp_path):
@@ -72,7 +73,7 @@ def test_a_version_4_database_upgrades_in_place_and_existing_tenants_are_confirm
     database.initialize()
     database.initialize()  # idempotent
 
-    assert _version(database) == 7
+    assert _version(database) == 8
     tenant = database.tenant_by_email("ada@example.com")
     assert tenant is not None
     assert tenant.inbox_confirmed_at == "2026-08-01T00:00:00+00:00"
@@ -90,7 +91,7 @@ def test_a_version_5_database_gains_the_relay_table_without_losing_accounts(tmp_
 
     database.initialize()
 
-    assert _version(database) == 7
+    assert _version(database) == 8
     assert database.tenant_by_id(tenant.id) == tenant
     with database._connect() as connection:
         tables = {row["name"] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -119,7 +120,7 @@ def test_a_half_finished_migration_leaves_the_database_untouched_and_still_upgra
 
     monkeypatch.undo()
     database.initialize()
-    assert _version(database) == 7
+    assert _version(database) == 8
     assert database.tenant_by_email("ada@example.com").inbox_confirmed_at == "2026-08-01T00:00:00+00:00"
 
 
@@ -138,11 +139,28 @@ def test_a_populated_version_6_database_gains_the_new_tables_and_keeps_its_libra
 
     database.initialize()
 
-    assert _version(database) == 7
+    assert _version(database) == 8
     assert database.get_item(TenantScope(tenant.id), "i1") == item
     with database._connect() as connection:
         tables = {row["name"] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"newsletter_preferences", "publications", "newsletter_organization"} <= tables
+
+
+def test_a_populated_version_7_database_gains_the_trash_table_and_keeps_its_library(tmp_path):
+    database = Database(tmp_path / "version-7.sqlite3")
+    database.initialize()
+    tenant = database.create_tenant(email="ada@example.com", inbox_local="ada")
+    item = _item("i1", tenant.id, title="Book", source="email")
+    database.insert_item(TenantScope(tenant.id), item)
+    with database._connect() as connection:
+        connection.execute("DROP TABLE trashed_items")
+        connection.execute("PRAGMA user_version = 7")
+
+    database.initialize()
+
+    assert _version(database) == 8
+    assert database.get_item(TenantScope(tenant.id), "i1") == item
+    assert database.trash_summary(TenantScope(tenant.id)) == (0, 0)
 
 
 def test_an_interrupted_additive_upgrade_finishes_on_the_next_start(tmp_path, monkeypatch):
@@ -157,7 +175,7 @@ def test_an_interrupted_additive_upgrade_finishes_on_the_next_start(tmp_path, mo
     monkeypatch.setattr(
         db_module,
         "SCHEMA",
-        db_module.SCHEMA.replace("PRAGMA user_version = 7;", "INSERT INTO no_such_table VALUES (1);"),
+        db_module.SCHEMA.replace("PRAGMA user_version = 8;", "INSERT INTO no_such_table VALUES (1);"),
     )
     with pytest.raises(sqlite3.OperationalError):
         database.initialize()
@@ -166,7 +184,7 @@ def test_an_interrupted_additive_upgrade_finishes_on_the_next_start(tmp_path, mo
     monkeypatch.undo()
     database.initialize()
 
-    assert _version(database) == 7
+    assert _version(database) == 8
     with database._connect() as connection:
         tables = {row["name"] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "newsletter_organization" in tables
@@ -1037,3 +1055,73 @@ def test_saved_pages_group_by_the_site_in_their_url(database):
     assert database.count_items(scope, **saved, site="example.com") == 3, "the filter agrees with the grouping"
     assert {i.id for i in database.list_items(scope, **saved, site="example.com")} == {"a", "b", "c"}
     assert database.count_items(scope, kind="article", source="url") == 7, "pages without a site still count as saved"
+
+
+# -- trash ---------------------------------------------------------------------
+
+
+def test_a_trashed_item_leaves_every_item_query_and_restores_unchanged(database):
+    tenant = database.create_tenant(email="ada@example.com", inbox_local="ada")
+    scope = TenantScope(tenant.id)
+    item = _item("i1", tenant.id, title="Book", source="email")
+    database.insert_item(scope, item)
+
+    assert database.trash_item(scope, "i1", now=STAMP) == item
+    assert database.get_item(scope, "i1") is None
+    assert database.list_items(scope) == []
+    assert database.count_items(scope) == 0
+    assert database.list_authors(scope) == []
+    assert database.item_by_sha256(scope, item.sha256) is None
+    assert database.get_trashed_item(scope, "i1").item == item
+    assert database.trash_summary(scope) == (1, item.size_bytes)
+    assert database.tenant_storage_bytes(scope) == item.size_bytes
+
+    assert database.restore_item(scope, "i1", now=STAMP) == item
+    assert database.get_trashed_item(scope, "i1") is None
+    assert database.trash_summary(scope) == (0, 0)
+
+
+def test_trash_is_scoped_to_the_tenant(database):
+    ada = database.create_tenant(email="ada@example.com", inbox_local="ada")
+    bob = database.create_tenant(email="bob@example.com", inbox_local="bob")
+    database.insert_item(TenantScope(ada.id), _item("i1", ada.id, title="Book", source="email"))
+
+    assert database.trash_item(TenantScope(bob.id), "i1", now=STAMP) is None
+    database.trash_item(TenantScope(ada.id), "i1", now=STAMP)
+    assert database.get_trashed_item(TenantScope(bob.id), "i1") is None
+    assert database.restore_item(TenantScope(bob.id), "i1", now=STAMP) is None
+    assert database.delete_trashed_item(TenantScope(bob.id), "i1") is False
+    assert database.list_trashed_items(TenantScope(bob.id)) == []
+
+
+def test_restore_puts_back_a_manual_assignment(database):
+    _, scope = _enabled_tenant(database)
+    _publication(database, scope, "p1", "Dense Discovery", now=STAMP)
+    database.assign_publication_manually(scope, "i1", publication_id="p1", now=STAMP)
+
+    database.trash_item(scope, "i1", now=STAMP)
+    assert database.organization_row(scope, "i1") is None
+    database.restore_item(scope, "i1", now=STAMP)
+
+    row = database.organization_row(scope, "i1")
+    assert (row["state"], row["manual"], row["publication_id"]) == ("done", 1, "p1")
+
+
+def test_restore_follows_a_merge_made_while_the_item_was_trashed(database):
+    _, scope = _enabled_tenant(database)
+    _publication(database, scope, "p1", "Dense Discovery", now=STAMP)
+    _publication(database, scope, "p2", "Dense Discovery (2)", now=STAMP)
+    database.assign_publication_manually(scope, "i1", publication_id="p1", now=STAMP)
+
+    database.trash_item(scope, "i1", now=STAMP)
+    assert database.merge_publications(scope, source_id="p1", target_id="p2", now=STAMP)
+    database.restore_item(scope, "i1", now=STAMP)
+
+    assert database.organization_row(scope, "i1")["publication_id"] == "p2"
+
+
+def test_an_unorganized_item_restores_as_still_waiting(database):
+    _, scope = _enabled_tenant(database)
+    database.trash_item(scope, "i1", now=STAMP)
+    database.restore_item(scope, "i1", now=STAMP)
+    assert database.organization_row(scope, "i1") is None

@@ -645,3 +645,16 @@ def test_the_site_feeds_resolve_from_the_root_with_authentication(client_and_ten
     # Percent-encoded so the client does not fold it into the path before sending.
     assert client.get("/opds/sites/%2e%2e", headers=headers).status_code == 404
     assert client.get("/opds/sites").status_code == 401
+
+
+def test_a_trashed_item_leaves_the_catalogue_and_its_download(client_and_tenants):
+    client, (alice, pw), _ = client_and_tenants
+    headers = _auth(alice, pw)
+    item = _store(client, alice, title="Trashed")
+    download = _entry_hrefs(client.get("/opds/recent", headers=headers).content)[0]
+
+    client.app.state.storage.trash(TenantScope(alice.id), item.id)
+
+    assert _entry_hrefs(client.get("/opds/recent", headers=headers).content) == []
+    assert client.get("/opds/search", params={"q": "Trashed"}, headers=headers).content.count(b"<entry") == 0
+    assert client.get(_local_path(download), headers=headers).status_code == 404

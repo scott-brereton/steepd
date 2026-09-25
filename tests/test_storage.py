@@ -521,3 +521,36 @@ def test_the_storage_report_flags_low_at_ten_percent_or_the_floor_whichever_is_l
     # A tiny volume: ten percent is below the floor, so the floor decides.
     _disk(monkeypatch, total=1 * gigabyte, free=DISK_FREE_FLOOR_BYTES - 1)
     assert store.storage_report().low is True
+
+
+def test_sending_a_trashed_file_again_restores_it_as_a_new_arrival(storage):
+    _, database, store = storage
+    tenant = database.create_tenant(email="a@example.com", inbox_local="a.1")
+    scope = TenantScope(tenant.id)
+    payload = _epub("Again")
+    first = store.store_bytes(scope, payload, filename="a.epub", kind="book", source="email").item
+    store.trash(scope, first.id)
+
+    again = store.store_bytes(scope, payload, filename="a.epub", kind="book", source="email")
+
+    assert again.duplicate is False
+    assert again.item.id == first.id
+    assert again.item.created_at > first.created_at
+    assert database.get_trashed_item(scope, first.id) is None
+    assert database.count_items(scope) == 1
+    assert database.tenant_storage_bytes(scope) == first.size_bytes
+
+
+def test_delete_all_for_tenant_also_removes_trashed_files(storage):
+    _, database, store = storage
+    tenant = database.create_tenant(email="a@example.com", inbox_local="a.1")
+    scope = TenantScope(tenant.id)
+    kept = store.store_bytes(scope, _epub("Kept"), filename="k.epub", kind="book", source="email").item
+    trashed = store.store_bytes(scope, _epub("Trashed"), filename="t.epub", kind="book", source="email").item
+    store.trash(scope, trashed.id)
+
+    assert store.delete_all_for_tenant(scope) == 2
+
+    assert not store.path_for(kept).exists()
+    assert not store.path_for(trashed).exists()
+    assert database.trash_summary(scope) == (0, 0)

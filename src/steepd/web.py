@@ -69,13 +69,14 @@ from steepd.models import (
     RefusedSender,
     SiteSummary,
     Tenant,
+    TrashedItem,
     UnorganizedIssue,
 )
 from steepd.outbound import OutboundEmailDisabled, OutboundEmailError, send_email
 from steepd.plans import FREE_PLAN, PAID_PLAN, quota_bytes, retention_for
 from steepd.publications import retention_cutoff
 from steepd.ratelimit import IMPORT_BUCKET
-from steepd.storage import ItemStorage
+from steepd.storage import TRASH_RETENTION, ItemStorage
 from steepd.tenancy import TenantScope
 from steepd.urlarticle import UrlArticleError, UrlArticleTooLarge, exact_subject_url
 
@@ -124,7 +125,16 @@ FORM_MAX_BYTES = 8 * 1024
 UPLOAD_PATH = "/account/library/upload"
 SAVE_URL_PATH = "/account/library/save-url"
 UPLOAD_FORM_OVERHEAD = 64 * 1024
-IMPORT_NOTICES = {"book": "Added to Books.", "article": "Added to Saved.", "duplicate": "Already in your library."}
+IMPORT_NOTICES = {
+    "book": "Added to Books.",
+    "article": "Added to Saved.",
+    "duplicate": "Already in your library.",
+    "trashed": f"Moved to Trash. You can restore it from Trash for {TRASH_RETENTION.days} days.",
+}
+TRASH_NOTICES = {"restored": "Restored to your library.", "deleted": "Deleted permanently."}
+# Trash fills one deletion at a time and empties itself after TRASH_RETENTION, so one page
+# is enough; past this many the oldest are left off rather than paged.
+TRASH_PAGE_LIMIT = 200
 # The newsletter forms carry longer fields -- a 120-character name, a 500-character note,
 # or a page of selected item ids and their result tokens -- and every character can cost
 # twelve bytes once percent-encoded, so 620 characters of astral-plane text alone is
@@ -321,6 +331,7 @@ border:1px solid var(--umber);border-radius:8px;padding:14px 16px;word-break:bre
 .items li{display:flex;gap:12px;align-items:center;justify-content:space-between;background:var(--card);
 border:1px solid var(--rule);border-radius:10px;padding:12px 16px;margin-bottom:8px}
 .items form{margin:0}
+.items .actions{display:flex;gap:8px;flex-shrink:0}
 .title{display:block;font-size:16px}
 .meta{display:block;font-size:14px;color:var(--muted)}
 .quiet{background:none;color:var(--almond);border:1px solid var(--rule);padding:8px 14px;font-size:14px}
@@ -893,7 +904,7 @@ def _library_page(
     )
 
 
-def _shelves_section(counts: dict[str, int]) -> str:
+def _shelves_section(counts: dict[str, int], *, trash_count: int = 0) -> str:
     """The account page's library: one row per shelf with its count, as a reader shows it.
 
     Newsletters links to the publications page rather than the flat list, because that is
@@ -907,6 +918,11 @@ def _shelves_section(counts: dict[str, int]) -> str:
         "</div></li>"
         for shelf, (title, _, _) in LIBRARY_SHELVES.items()
     )
+    if trash_count:
+        rows += (
+            '<li><div><span class="title"><a href="/account/trash">Trash</a></span>'
+            f'<span class="meta">{trash_count} item{"s" if trash_count != 1 else ""}</span></div></li>'
+        )
     return f'<section><h2>Your library</h2><ul class="items">{rows}</ul></section>'
 
 
@@ -998,6 +1014,43 @@ def _email_verification_section(
     )
 
 
+def _trash_row(entry: TrashedItem) -> str:
+    item = entry.item
+    meta = f"{item.kind.capitalize()} · {_human_size(item.size_bytes)} · deleted {_short_date(entry.deleted_at)}"
+    item_id = html.escape(item.id)
+    return (
+        "<li><div>"
+        f'<span class="title">{html.escape(item.title)}</span>'
+        f'<span class="meta">{html.escape(meta)}</span>'
+        '</div><div class="actions">'
+        f'<form method="post" action="/account/trash/{item_id}/restore">'
+        '<button class="quiet" type="submit">Restore</button></form>'
+        f'<form method="post" action="/account/trash/{item_id}/delete">'
+        '<button class="quiet" type="submit">Delete permanently</button></form></div></li>'
+    )
+
+
+def _trash_page(entries: list[TrashedItem], *, total: int, total_bytes: int, notice: str = "") -> HTMLResponse:
+    days = _human_days(TRASH_RETENTION.days)
+    if entries:
+        summary = f"{total} item{'s' if total != 1 else ''}, {_human_size(total_bytes)}"
+        listing = (
+            f'<p class="fineprint">{html.escape(summary)}</p>'
+            f'<ul class="items">{"".join(_trash_row(entry) for entry in entries)}</ul>'
+        )
+    else:
+        listing = "<p>Nothing in Trash.</p>"
+    return _page(
+        "Steepd — trash",
+        "<h1>Trash</h1>"
+        f"{_notice(notice)}"
+        f"<p>Deleted items stay here for {days}, then they are deleted permanently. "
+        "Until then they still count toward your storage.</p>"
+        f"{listing}"
+        '<p class="fineprint"><a href="/account">Back to your account</a></p>',
+    )
+
+
 def _account_page(
     tenant: Tenant,
     counts: dict[str, int],
@@ -1012,6 +1065,7 @@ def _account_page(
     email_verification_until: str | None,
     email_verification_available: bool,
     import_panel: str = "",
+    trash_count: int = 0,
     error: str = "",
     status_code: int = status.HTTP_200_OK,
 ) -> HTMLResponse:
@@ -1036,7 +1090,7 @@ def _account_page(
         '<p class="fineprint"><a href="/devices">How to set this up on your reader</a></p>'
         f"{import_panel}"
         f"{organization}"
-        f"{_shelves_section(counts)}"
+        f"{_shelves_section(counts, trash_count=trash_count)}"
         f"{_senders_section(tenant, senders, refused)}"
         f"{verification}"
         "<section><h2>Device password</h2>"
@@ -2448,6 +2502,7 @@ def build_web_router(
             import_panel=_add_to_library(
                 settings.max_upload_bytes, field=import_field, error=import_error, url=import_url
             ),
+            trash_count=database.trash_summary(scope)[0],
             error=error,
             status_code=status_code,
         )
@@ -2873,11 +2928,34 @@ def build_web_router(
 
     @router.post("/account/items/{item_id}/delete", dependencies=[SameOrigin])
     async def delete_item(item_id: str, session: SignedIn) -> Response:
-        # The return value is deliberately ignored: an unknown or already-deleted id is
-        # the same outcome from where the user is standing, and reporting it would make
-        # this route say whether an id exists.
-        await run_in_threadpool(storage.delete, TenantScope(session.tenant.id), item_id)
-        return _redirect("/account/library")
+        # To the trash, not gone: this is one click with no confirmation. The return value
+        # is deliberately ignored: an unknown or already-deleted id is the same outcome
+        # from where the user is standing, and reporting it would make this route say
+        # whether an id exists.
+        await run_in_threadpool(storage.trash, TenantScope(session.tenant.id), item_id)
+        return _redirect("/account/library?notice=trashed")
+
+    @router.get("/account/trash")
+    def trash(session: SignedIn, notice: str = "") -> Response:
+        scope = TenantScope(session.tenant.id)
+        total, total_bytes = database.trash_summary(scope)
+        return _trash_page(
+            database.list_trashed_items(scope, limit=TRASH_PAGE_LIMIT),
+            total=total,
+            total_bytes=total_bytes,
+            notice=TRASH_NOTICES.get(notice, ""),
+        )
+
+    # Both answer the same whether or not the id was in this tenant's trash, like delete.
+    @router.post("/account/trash/{item_id}/restore", dependencies=[SameOrigin])
+    async def restore_item(item_id: str, session: SignedIn) -> Response:
+        await run_in_threadpool(storage.restore, TenantScope(session.tenant.id), item_id)
+        return _redirect("/account/trash?notice=restored")
+
+    @router.post("/account/trash/{item_id}/delete", dependencies=[SameOrigin])
+    async def purge_item(item_id: str, session: SignedIn) -> Response:
+        await run_in_threadpool(storage.purge, TenantScope(session.tenant.id), item_id)
+        return _redirect("/account/trash?notice=deleted")
 
     # -- newsletters and publications --------------------------------------
 

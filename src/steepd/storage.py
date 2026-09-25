@@ -9,7 +9,7 @@ import uuid
 from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from steepd.config import Settings
@@ -23,7 +23,7 @@ from steepd.epub import (
     sanitize_filename,
 )
 from steepd.models import Item
-from steepd.plans import FREE_PLAN, quota_bytes
+from steepd.plans import FREE_PLAN, quota_bytes, retention_for
 from steepd.tenancy import TenantScope
 
 # Item stores are refused while less than this is free on the volume. It is headroom for
@@ -35,6 +35,10 @@ DISK_FREE_FLOOR_BYTES = 250 * 1024 * 1024
 # Below this share of the volume, /healthz reports storage as low so the uptime worker can
 # say so before the floor above is reached.
 DISK_LOW_FRACTION = 0.10
+
+# How long a deleted item can be restored before the sweep removes it for good. The same on
+# every plan: it is for undoing a mistake, not extra storage.
+TRASH_RETENTION = timedelta(days=7)
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +179,18 @@ class ItemStorage:
                     temporary_path.unlink(missing_ok=True)
                     temporary_path = None
                     return StoreResult(item=existing, duplicate=True)
+                # Sending a file again after deleting it is asking for it back. It returns
+                # as a new arrival, which is what it is from where the sender stands, and
+                # the copy already on disk is reused rather than stored twice.
+                trashed = self.database.trashed_item_by_sha256(scope, sha256)
+                if trashed is not None:
+                    temporary_path.unlink(missing_ok=True)
+                    temporary_path = None
+                    moment = datetime.now(UTC).isoformat()
+                    restored = self.database.restore_item(scope, trashed.item.id, now=moment, created_at=moment)
+                    if restored is not None:
+                        return StoreResult(item=restored, duplicate=False)
+                    raise UnsafeEpub("A trashed copy of this item could not be restored")
 
                 # After the duplicate check, so re-sending a file the tenant already has
                 # stays a duplicate rather than becoming a quota error -- it adds no bytes.
@@ -263,8 +279,56 @@ class ItemStorage:
             self._fsync_directory(self._tenant_dir(item.tenant_id))
             return True
 
+    def trash(self, scope: TenantScope, item_id: str) -> bool:
+        """Move an item to the trash. The file stays where it is until purge()."""
+        with self._lock:
+            return self.database.trash_item(scope, item_id, now=datetime.now(UTC).isoformat()) is not None
+
+    def restore(self, scope: TenantScope, item_id: str) -> bool:
+        """Put a trashed item back in the library.
+
+        An item already past its plan's retention would be deleted by the next sweep,
+        within the hour, so it comes back as a new arrival instead. That gives nothing a
+        re-upload of the same file would not.
+        """
+        with self._lock:
+            trashed = self.database.get_trashed_item(scope, item_id)
+            if trashed is None:
+                return False
+            now = datetime.now(UTC)
+            tenant = self.database.tenant_by_id(scope.tenant_id)
+            retention = retention_for(tenant.plan if tenant is not None else FREE_PLAN, settings=self.settings)
+            created_at = None
+            if retention is not None and datetime.fromisoformat(trashed.item.created_at) < now - retention:
+                created_at = now.isoformat()
+            return self.database.restore_item(scope, item_id, now=now.isoformat(), created_at=created_at) is not None
+
+    def purge(self, scope: TenantScope, item_id: str) -> bool:
+        """Permanently delete a trashed item and its file. Mirrors delete()."""
+        with self._lock:
+            trashed = self.database.get_trashed_item(scope, item_id)
+            if trashed is None:
+                return False
+            source = self.path_for(trashed.item)
+            staged = self.trash_dir / f"{item_id}.epub"
+            if source.exists():
+                os.replace(source, staged)
+            try:
+                if not self.database.delete_trashed_item(scope, item_id):
+                    if staged.exists():
+                        os.replace(staged, source)
+                    return False
+            except Exception:
+                if staged.exists():
+                    os.replace(staged, source)
+                raise
+            staged.unlink(missing_ok=True)
+            self._fsync_directory(self._tenant_dir(scope.tenant_id))
+            return True
+
     def delete_all_for_tenant(self, scope: TenantScope) -> int:
-        """Delete every one of the tenant's items and return how many went.
+        """Delete every one of the tenant's items, trashed ones included, and return how
+        many went.
 
         Each one goes through delete(), so every file takes the same trash-staged, fsynced
         path as a single deletion and a failure part-way through leaves the rest consistent
@@ -279,6 +343,15 @@ class ItemStorage:
             progressed = False
             for item in items:
                 if self.delete(scope, item.id):
+                    deleted += 1
+                    progressed = True
+            if not progressed:
+                break
+        while True:
+            trashed = self.database.list_trashed_items(scope, limit=100)
+            progressed = False
+            for entry in trashed:
+                if self.purge(scope, entry.item.id):
                     deleted += 1
                     progressed = True
             if not progressed:

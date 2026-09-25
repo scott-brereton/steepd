@@ -25,6 +25,7 @@ from steepd.models import (
     RefusedSender,
     SiteSummary,
     Tenant,
+    TrashedItem,
     UnorganizedIssue,
 )
 from steepd.plans import KNOWN_PLANS
@@ -265,10 +266,48 @@ CREATE INDEX IF NOT EXISTS newsletter_organization_due_idx
 CREATE INDEX IF NOT EXISTS publications_name_idx
     ON publications(tenant_id, name COLLATE NOCASE, id);
 
-PRAGMA user_version = 7;
+-- Items their owner deleted, kept for TRASH_RETENTION (steepd.storage) so a mistaken
+-- Delete can be undone. A table of its own rather than a flag on items: every list, count,
+-- search and feed reads items, so none of them needs a filter that could be forgotten. The
+-- file stays where it was on disk until a purge, and its bytes still count toward quota.
+CREATE TABLE IF NOT EXISTS trashed_items (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    storage_name TEXT NOT NULL UNIQUE,
+    download_filename TEXT NOT NULL,
+    title TEXT NOT NULL,
+    author TEXT NOT NULL DEFAULT '',
+    language TEXT NOT NULL DEFAULT '',
+    identifier TEXT NOT NULL DEFAULT '',
+    source_url TEXT NOT NULL DEFAULT '',
+    size_bytes INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT,
+    source TEXT NOT NULL,
+    deleted_at TEXT NOT NULL,
+    -- A finished newsletter_organization row, copied here because that row is removed with
+    -- the item (ON DELETE CASCADE). Restore puts it back, so a restored issue keeps its
+    -- publication, or the owner's Keep ungrouped, instead of being classified again.
+    -- NULL organization_state means there was nothing finished to keep.
+    organization_state TEXT,
+    organization_publication_id TEXT,
+    organization_manual INTEGER NOT NULL DEFAULT 0,
+    organization_attempts INTEGER NOT NULL DEFAULT 0,
+    organization_error_code TEXT
+);
+
+-- Per tenant, like items_tenant_sha_idx: re-sending a trashed file restores it rather than
+-- storing a second copy, so there is never more than one.
+CREATE UNIQUE INDEX IF NOT EXISTS trashed_items_tenant_sha_idx ON trashed_items(tenant_id, sha256);
+CREATE INDEX IF NOT EXISTS trashed_items_tenant_deleted_idx ON trashed_items(tenant_id, deleted_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS trashed_items_deleted_idx ON trashed_items(deleted_at);
+
+PRAGMA user_version = 8;
 """
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # Columns cannot be added by CREATE TABLE IF NOT EXISTS, so a database already carrying
 # tenants gets them by hand. Every existing account keeps its name and counts as
@@ -313,6 +352,28 @@ _SITE_HOST = (
 SITE_SQL = f"CASE WHEN ({_SITE_HOST}) LIKE 'www.%' THEN substr(({_SITE_HOST}), 5) ELSE ({_SITE_HOST}) END"
 
 
+# The columns items and trashed_items share, in one order, so moving a row between them
+# is a single INSERT ... SELECT that cannot drop or misplace one.
+_ITEM_COLUMNS = (
+    "id",
+    "tenant_id",
+    "kind",
+    "sha256",
+    "storage_name",
+    "download_filename",
+    "title",
+    "author",
+    "language",
+    "identifier",
+    "source_url",
+    "size_bytes",
+    "created_at",
+    "expires_at",
+    "source",
+)
+_ITEM_COLUMN_LIST = ", ".join(_ITEM_COLUMNS)
+
+
 class AllowedSenderCapReached(ValueError):
     pass
 
@@ -338,7 +399,7 @@ class Database:
         through CREATE TABLE IF NOT EXISTS, without rewriting the tenants table; a v6
         database gains the three newsletter-organization tables the same way.
 
-        6 -> 7 needs no migration branch because it adds only tables and indexes, which
+        6 -> 7 and 7 -> 8 need no migration branch because they add only tables and indexes, which
         CREATE ... IF NOT EXISTS expresses idempotently. executescript commits each
         statement on its own, so an interrupted run leaves some tables present and
         user_version behind -- and the next start finishes the job rather than having to
@@ -397,6 +458,15 @@ class Database:
     @staticmethod
     def _item(row: sqlite3.Row | None) -> Item | None:
         return Item(**dict(row)) if row is not None else None
+
+    @staticmethod
+    def _trashed_item(row: sqlite3.Row | None) -> TrashedItem | None:
+        if row is None:
+            return None
+        values = dict(row)
+        return TrashedItem(
+            item=Item(**{column: values[column] for column in _ITEM_COLUMNS}), deleted_at=values["deleted_at"]
+        )
 
     # -- tenants ------------------------------------------------------
 
@@ -1101,11 +1171,14 @@ class Database:
     def tenant_storage_bytes(self, scope: TenantScope) -> int:
         """What this tenant's stored items add up to, for the quota check in ItemStorage.
 
-        SUM returns NULL for a tenant with no items, which is 0 bytes used.
+        Trashed items are included: their files are still on disk until the purge. SUM
+        returns NULL for a tenant with no items, which is 0 bytes used.
         """
         with self._session() as connection:
             row = connection.execute(
-                "SELECT SUM(size_bytes) FROM items WHERE tenant_id = ?", (scope.tenant_id,)
+                "SELECT (SELECT COALESCE(SUM(size_bytes), 0) FROM items WHERE tenant_id = ?)"
+                " + (SELECT COALESCE(SUM(size_bytes), 0) FROM trashed_items WHERE tenant_id = ?)",
+                (scope.tenant_id, scope.tenant_id),
             ).fetchone()
         return int(row[0] or 0)
 
@@ -1143,6 +1216,177 @@ class Database:
                     )
                 self._touch_catalogue(connection, scope.tenant_id, now)
         return cursor.rowcount == 1
+
+    # -- trash ------------------------------------------------------------
+    # Moving a row between items and trashed_items is the whole of soft deletion. Nothing
+    # here touches files; ItemStorage calls these under its lock, which is what keeps a
+    # trash, a restore, a purge and a retention delete of one item from interleaving.
+
+    def trash_item(self, scope: TenantScope, item_id: str, *, now: str) -> Item | None:
+        """Move an item to the trash. None when this tenant has no such item."""
+        with self._write_lock, self._session() as connection:
+            row = connection.execute(
+                "SELECT * FROM items WHERE tenant_id = ? AND id = ?", (scope.tenant_id, item_id)
+            ).fetchone()
+            if row is None:
+                return None
+            organization = connection.execute(
+                """
+                SELECT state, publication_id, manual, attempts, error_code FROM newsletter_organization
+                 WHERE tenant_id = ? AND item_id = ? AND state IN ('done', 'unrecognized', 'failed')
+                """,
+                (scope.tenant_id, item_id),
+            ).fetchone()
+            connection.execute(
+                f"""
+                INSERT INTO trashed_items (
+                    {_ITEM_COLUMN_LIST}, deleted_at, organization_state, organization_publication_id,
+                    organization_manual, organization_attempts, organization_error_code
+                )
+                SELECT {_ITEM_COLUMN_LIST}, ?, ?, ?, ?, ?, ? FROM items WHERE tenant_id = ? AND id = ?
+                """,
+                (
+                    now,
+                    organization["state"] if organization else None,
+                    organization["publication_id"] if organization else None,
+                    organization["manual"] if organization else 0,
+                    organization["attempts"] if organization else 0,
+                    organization["error_code"] if organization else None,
+                    scope.tenant_id,
+                    item_id,
+                ),
+            )
+            # Cascades to newsletter_organization. newsletter_deliveries stays, so a repeat
+            # forward of a trashed newsletter is still recognised as a repeat.
+            connection.execute("DELETE FROM items WHERE tenant_id = ? AND id = ?", (scope.tenant_id, item_id))
+            self._touch_after_move(connection, scope.tenant_id, organization, now)
+        return self._item(row)
+
+    def restore_item(
+        self, scope: TenantScope, item_id: str, *, now: str, created_at: str | None = None
+    ) -> Item | None:
+        """Move a trashed item back. None when this tenant has no such trashed item.
+
+        `created_at` replaces the arrival time when given: the caller passes one when the
+        original would put the item straight back in front of the retention sweep.
+        """
+        with self._write_lock, self._session() as connection:
+            row = connection.execute(
+                "SELECT * FROM trashed_items WHERE tenant_id = ? AND id = ?", (scope.tenant_id, item_id)
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                f"INSERT INTO items ({_ITEM_COLUMN_LIST}) "
+                f"SELECT {_ITEM_COLUMN_LIST} FROM trashed_items WHERE tenant_id = ? AND id = ?",
+                (scope.tenant_id, item_id),
+            )
+            if created_at is not None:
+                connection.execute(
+                    "UPDATE items SET created_at = ? WHERE tenant_id = ? AND id = ?",
+                    (created_at, scope.tenant_id, item_id),
+                )
+            organization = None
+            if row["organization_state"] is not None:
+                # Merged publications keep their rows, so the id still resolves; a merge
+                # since the trash means the survivor is where the issue belongs now.
+                publication_id = row["organization_publication_id"]
+                if publication_id is not None:
+                    target = connection.execute(
+                        "SELECT COALESCE(merged_into_id, id) FROM publications WHERE tenant_id = ? AND id = ?",
+                        (scope.tenant_id, publication_id),
+                    ).fetchone()
+                    publication_id = target[0] if target else None
+                if publication_id is not None or row["organization_publication_id"] is None:
+                    connection.execute(
+                        """
+                        INSERT INTO newsletter_organization (
+                            tenant_id, item_id, publication_id, state, manual, attempts, error_code
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            scope.tenant_id,
+                            item_id,
+                            publication_id,
+                            row["organization_state"],
+                            row["organization_manual"],
+                            row["organization_attempts"],
+                            row["organization_error_code"],
+                        ),
+                    )
+                    organization = {"publication_id": publication_id}
+            connection.execute("DELETE FROM trashed_items WHERE tenant_id = ? AND id = ?", (scope.tenant_id, item_id))
+            self._touch_after_move(connection, scope.tenant_id, organization, now)
+            restored = connection.execute(
+                "SELECT * FROM items WHERE tenant_id = ? AND id = ?", (scope.tenant_id, item_id)
+            ).fetchone()
+        return self._item(restored)
+
+    def _touch_after_move(
+        self, connection: sqlite3.Connection, tenant_id: str, organization: Mapping[str, Any] | None, now: str
+    ) -> None:
+        # The same clocks delete_item advances, for the same reason: the newest arrival
+        # cannot express an item leaving or coming back, so a feed would look unchanged.
+        if organization is not None and organization["publication_id"] is not None:
+            connection.execute(
+                "UPDATE publications SET updated_at = ? WHERE tenant_id = ? AND id = ?",
+                (now, tenant_id, organization["publication_id"]),
+            )
+        self._touch_catalogue(connection, tenant_id, now)
+
+    def get_trashed_item(self, scope: TenantScope, item_id: str) -> TrashedItem | None:
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT * FROM trashed_items WHERE tenant_id = ? AND id = ?", (scope.tenant_id, item_id)
+            ).fetchone()
+        return self._trashed_item(row)
+
+    def trashed_item_by_sha256(self, scope: TenantScope, sha256: str) -> TrashedItem | None:
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT * FROM trashed_items WHERE tenant_id = ? AND sha256 = ?", (scope.tenant_id, sha256)
+            ).fetchone()
+        return self._trashed_item(row)
+
+    def list_trashed_items(self, scope: TenantScope, *, limit: int = 50, offset: int = 0) -> list[TrashedItem]:
+        with self._session() as connection:
+            rows = connection.execute(
+                "SELECT * FROM trashed_items WHERE tenant_id = ? ORDER BY deleted_at DESC, id DESC LIMIT ? OFFSET ?",
+                (scope.tenant_id, limit, offset),
+            ).fetchall()
+        return [self._trashed_item(row) for row in rows]
+
+    def trash_summary(self, scope: TenantScope) -> tuple[int, int]:
+        """How many items are in the trash, and their bytes."""
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) FROM trashed_items WHERE tenant_id = ?",
+                (scope.tenant_id,),
+            ).fetchone()
+        return int(row[0]), int(row[1])
+
+    def delete_trashed_item(self, scope: TenantScope, item_id: str) -> bool:
+        with self._write_lock, self._session() as connection:
+            cursor = connection.execute(
+                "DELETE FROM trashed_items WHERE tenant_id = ? AND id = ?", (scope.tenant_id, item_id)
+            )
+            if cursor.rowcount == 1:
+                # Kept while the item was recoverable; see delete_item for why it goes now.
+                connection.execute(
+                    "DELETE FROM newsletter_deliveries WHERE tenant_id = ? AND item_id = ?",
+                    (scope.tenant_id, item_id),
+                )
+        return cursor.rowcount == 1
+
+    def list_trash_past_retention(self, *, cutoff: str, limit: int = 500) -> list[TrashedItem]:
+        """Trashed items deleted before `cutoff`, oldest first. Unscoped, like
+        list_items_past_retention, and for the same reason: the sweep covers everyone."""
+        with self._session() as connection:
+            rows = connection.execute(
+                "SELECT * FROM trashed_items WHERE deleted_at < ? ORDER BY deleted_at ASC, id ASC LIMIT ?",
+                (cutoff, limit),
+            ).fetchall()
+        return [self._trashed_item(row) for row in rows]
 
     # -- operator stats ------------------------------------------------------
     # Read by `python -m steepd stats` only. Unscoped by design, like the sweep: it is a

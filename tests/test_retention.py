@@ -6,6 +6,7 @@ import pytest
 
 from steepd import app as app_module
 from steepd import retention
+from steepd import storage as storage_module
 from steepd.config import Settings
 from steepd.db import Database
 from steepd.epubgen import build_epub
@@ -357,3 +358,85 @@ def test_old_refused_senders_are_pruned(service):
 
     assert result.refused_senders_pruned == 1
     assert [r.address for r in database.list_refused_senders(tenant.id)] == ["new@example.com"]
+
+
+# -- trash ---------------------------------------------------------------------
+
+
+def _trash(database, storage, item, *, days_ago):
+    scope = TenantScope(item.tenant_id)
+    assert storage.trash(scope, item.id)
+    deleted_at = (NOW - timedelta(days=days_ago)).isoformat()
+    with database._connect() as connection:
+        connection.execute("UPDATE trashed_items SET deleted_at = ? WHERE id = ?", (deleted_at, item.id))
+
+
+def test_a_trashed_item_gets_its_full_recovery_period_whatever_its_age(service):
+    database, storage = service
+    tenant = database.create_tenant(email="a@example.com", inbox_local="a.1")
+    old_path, old = _stored(database, storage, tenant.id, "Old", age_days=365)
+    _trash(database, storage, old, days_ago=1)
+
+    result = run_sweep(database, storage, now=NOW)
+
+    assert (result.items_deleted, result.trash_purged) == (0, 0)
+    assert old_path.is_file()
+    assert database.get_trashed_item(TenantScope(tenant.id), old.id) is not None
+
+
+def test_trash_past_its_recovery_period_is_purged_with_its_file(service):
+    database, storage = service
+    tenant = database.create_tenant(email="a@example.com", inbox_local="a.1")
+    scope = TenantScope(tenant.id)
+    expired_path, expired = _stored(database, storage, tenant.id, "Expired", age_days=1)
+    kept_path, kept = _stored(database, storage, tenant.id, "Kept", age_days=1)
+    _trash(database, storage, expired, days_ago=storage_module.TRASH_RETENTION.days + 1)
+    _trash(database, storage, kept, days_ago=storage_module.TRASH_RETENTION.days - 1)
+
+    result = run_sweep(database, storage, now=NOW)
+
+    assert result.trash_purged == 1
+    assert not expired_path.exists()
+    assert database.get_trashed_item(scope, expired.id) is None
+    assert kept_path.is_file()
+    assert database.tenant_storage_bytes(scope) == kept.size_bytes
+
+
+def test_a_candidate_trashed_after_the_sweep_read_it_is_not_hard_deleted(service):
+    """The sweep lists candidates, then deletes them one by one. An item trashed in
+    between must stay recoverable: delete() only acts on rows still in items."""
+    database, storage = service
+    tenant = database.create_tenant(email="a@example.com", inbox_local="a.1")
+    path, item = _stored(database, storage, tenant.id, "Raced", age_days=365)
+    candidates = database.list_items_past_retention(
+        cutoff=(NOW - storage.settings.free_retention).isoformat(), plan=FREE_PLAN
+    )
+    assert [candidate.id for candidate in candidates] == [item.id]
+
+    storage.trash(TenantScope(tenant.id), item.id)
+
+    assert storage.delete(TenantScope(tenant.id), item.id) is False
+    assert path.is_file()
+    assert database.get_trashed_item(TenantScope(tenant.id), item.id) is not None
+
+
+def test_restoring_an_item_past_retention_brings_it_back_as_a_new_arrival(service):
+    """Otherwise the next hourly sweep would delete what the owner just restored."""
+    database, storage = service
+    tenant = database.create_tenant(email="a@example.com", inbox_local="a.1")
+    scope = TenantScope(tenant.id)
+    # restore() reads the real clock, so these ages are relative to it rather than NOW.
+    real_now = datetime.now(UTC)
+    _, old = _stored(database, storage, tenant.id, "Old", age_days=0)
+    _, recent = _stored(database, storage, tenant.id, "Recent", age_days=0)
+    ages = {old.id: real_now - timedelta(days=365), recent.id: real_now - timedelta(days=1)}
+    with database._connect() as connection:
+        for item_id, created_at in ages.items():
+            connection.execute("UPDATE items SET created_at = ? WHERE id = ?", (created_at.isoformat(), item_id))
+    for item in (old, recent):
+        storage.trash(scope, item.id)
+        assert storage.restore(scope, item.id)
+
+    assert database.get_item(scope, old.id).created_at >= real_now.isoformat()
+    assert database.get_item(scope, recent.id).created_at == ages[recent.id].isoformat()
+    assert run_sweep(database, storage, now=datetime.now(UTC)).items_deleted == 0

@@ -552,26 +552,69 @@ def test_configured_plan_limits_stay_consistent_and_isolated_between_apps(tmp_pa
 # -- deletion ----------------------------------------------------------------
 
 
-def test_deleting_an_item_removes_the_row_and_the_file(web):
+def test_delete_moves_an_item_to_trash_where_it_can_be_restored(web):
+    """Delete is one click with no confirmation, so it has to be undoable."""
+    client, sent = web
+    _sign_up(client, sent)
+    database = client.app.state.database
+    tenant = database.tenant_by_email(EMAIL)
+    scope = TenantScope(tenant.id)
+    item = _store_item(client, tenant)
+    path = client.app.state.storage.path_for(item)
+
+    response = client.post(f"/account/items/{item.id}/delete", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/account/library?notice=trashed"
+    assert "Moved to Trash" in client.get(response.headers["location"]).text
+    assert database.get_item(scope, item.id) is None
+    assert "A stored book" not in client.get("/account/library").text
+    # Still on disk and still counted until it is purged.
+    assert path.is_file()
+    assert database.tenant_storage_bytes(scope) == item.size_bytes
+    assert 'href="/account/trash"' in client.get("/account").text
+    assert "A stored book" in client.get("/account/trash").text
+
+    response = client.post(f"/account/trash/{item.id}/restore", follow_redirects=False)
+    assert response.headers["location"] == "/account/trash?notice=restored"
+    assert database.get_item(scope, item.id) == item
+    assert "A stored book" in client.get("/account/library").text
+    assert 'href="/account/trash"' not in client.get("/account").text
+
+
+def test_deleting_permanently_from_trash_removes_the_row_and_the_file(web):
     """A delete that drops the row but leaves the file keeps paid-for storage occupied by
     something the owner believes is gone."""
     client, sent = web
     _sign_up(client, sent)
     database = client.app.state.database
     tenant = database.tenant_by_email(EMAIL)
+    scope = TenantScope(tenant.id)
     item = _store_item(client, tenant)
     path = client.app.state.storage.path_for(item)
-    assert path.is_file()
+    client.post(f"/account/items/{item.id}/delete")
 
-    library = client.get("/account/library")
-    assert "A stored book" in library.text
-
-    response = client.post(f"/account/items/{item.id}/delete", follow_redirects=False)
-    assert response.status_code == 303
-    assert response.headers["location"] == "/account/library"
-    assert database.get_item(TenantScope(tenant.id), item.id) is None
+    response = client.post(f"/account/trash/{item.id}/delete", follow_redirects=False)
+    assert response.headers["location"] == "/account/trash?notice=deleted"
+    assert database.get_trashed_item(scope, item.id) is None
     assert not path.exists()
-    assert "A stored book" not in client.get("/account/library").text
+    assert database.tenant_storage_bytes(scope) == 0
+    assert "Nothing in Trash." in client.get("/account/trash").text
+
+
+def test_trash_routes_do_not_reach_another_tenants_items(web):
+    client, sent = web
+    _sign_up(client, sent)
+    database = client.app.state.database
+    other = database.create_tenant(email="other@example.com", inbox_local="other")
+    storage = client.app.state.storage
+    item = _store_item(client, other)
+    storage.trash(TenantScope(other.id), item.id)
+
+    assert "A stored book" not in client.get("/account/trash").text
+    client.post(f"/account/trash/{item.id}/restore")
+    client.post(f"/account/trash/{item.id}/delete")
+    assert database.get_trashed_item(TenantScope(other.id), item.id) is not None
+    assert storage.path_for(item).is_file()
 
 
 def test_an_item_title_cannot_carry_markup_onto_the_account_page(web):
@@ -595,7 +638,7 @@ def test_deleting_an_unknown_item_still_returns_to_the_library(web):
     _sign_up(client, sent)
     response = client.post("/account/items/does-not-exist/delete", follow_redirects=False)
     assert response.status_code == 303
-    assert response.headers["location"] == "/account/library"
+    assert response.headers["location"] == "/account/library?notice=trashed"
 
 
 def test_deleting_the_account_removes_the_tenant_its_files_and_its_sessions(web):
