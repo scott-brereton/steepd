@@ -582,6 +582,34 @@ def test_delete_moves_an_item_to_trash_where_it_can_be_restored(web):
     assert 'href="/account/trash"' not in client.get("/account").text
 
 
+def test_delete_returns_to_the_same_place_in_the_library(web):
+    """Deleting several items in a row should not throw the reader back to the first page."""
+    client, sent = web
+    _sign_up(client, sent)
+    tenant = client.app.state.database.tenant_by_email(EMAIL)
+    first = _store_item(client, tenant, title="Alpha book")
+    second = _store_item(client, tenant, title="Beta book")
+
+    page = client.get("/account/library?shelf=books&q=book&sort=title").text
+    action = re.search(rf'action="(/account/items/{first.id}/delete[^"]*)"', page).group(1).replace("&amp;", "&")
+    assert f"anchor={second.id}" in action
+
+    response = client.post(action, follow_redirects=False)
+    assert response.headers["location"] == (
+        f"/account/library?shelf=books&q=book&sort=title&notice=trashed#item-{second.id}"
+    )
+    assert f'id="item-{second.id}"' in client.get(response.headers["location"].split("#")[0]).text
+
+
+def test_delete_ignores_a_redirect_it_did_not_build(web):
+    client, sent = web
+    _sign_up(client, sent)
+    response = client.post(
+        "/account/items/x/delete?shelf=https://evil.example&anchor=%22%3E%3Cscript%3E", follow_redirects=False
+    )
+    assert response.headers["location"] == "/account/library?notice=trashed"
+
+
 def test_deleting_permanently_from_trash_removes_the_row_and_the_file(web):
     """A delete that drops the row but leaves the file keeps paid-for storage occupied by
     something the owner believes is gone."""

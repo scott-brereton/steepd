@@ -251,6 +251,29 @@ def _clean_page(raw: str) -> int:
     return max(1, page)
 
 
+def _library_params(
+    *,
+    shelf: str = LIBRARY_DEFAULT_SHELF,
+    site: str = "",
+    query: str = "",
+    sort: str = ACCOUNT_DEFAULT_SORT,
+    page: int = 1,
+) -> list[tuple[str, str]]:
+    """The /account/library query parameters that are not defaults, in a fixed order."""
+    params: list[tuple[str, str]] = []
+    if shelf != LIBRARY_DEFAULT_SHELF:
+        params.append(("shelf", shelf))
+    if site:
+        params.append(("site", site))
+    if query:
+        params.append(("q", query))
+    if sort != ACCOUNT_DEFAULT_SORT:
+        params.append(("sort", sort))
+    if page > 1:
+        params.append(("page", str(page)))
+    return params
+
+
 def _library_href(
     *,
     shelf: str = LIBRARY_DEFAULT_SHELF,
@@ -265,17 +288,7 @@ def _library_href(
     parameters have to reach the browser as `&amp;`, and a link that skipped that would
     only misbehave once a page had two parameters on it, which is every paginated search.
     """
-    params: list[tuple[str, str]] = []
-    if shelf != LIBRARY_DEFAULT_SHELF:
-        params.append(("shelf", shelf))
-    if site:
-        params.append(("site", site))
-    if query:
-        params.append(("q", query))
-    if sort != ACCOUNT_DEFAULT_SORT:
-        params.append(("sort", sort))
-    if page > 1:
-        params.append(("page", str(page)))
+    params = _library_params(shelf=shelf, site=site, query=query, sort=sort, page=page)
     return html.escape(f"/account/library?{urlencode(params)}" if params else "/account/library", quote=True)
 
 
@@ -705,7 +718,7 @@ def _remaining_retention_days(item: Item, retention: timedelta, *, now: datetime
     return max(0, math.ceil(seconds_remaining / timedelta(days=1).total_seconds()))
 
 
-def _item_row(item: Item, *, retention: timedelta | None, now: datetime) -> str:
+def _item_row(item: Item, *, retention: timedelta | None, now: datetime, delete_query: str) -> str:
     meta = f"{item.kind.capitalize()} · {_human_size(item.size_bytes)} · {item.created_at[:10]}"
     if item.starred_at:
         meta += " · starred"
@@ -713,13 +726,14 @@ def _item_row(item: Item, *, retention: timedelta | None, now: datetime) -> str:
     if retention is not None:
         days = _remaining_retention_days(item, retention, now=now)
         removal_note = f'<span class="meta">removed in {_human_days(days)}</span>'
+    action = f"/account/items/{item.id}/delete?{delete_query}" if delete_query else f"/account/items/{item.id}/delete"
     return (
-        "<li><div>"
+        f'<li id="item-{html.escape(item.id, quote=True)}"><div>'
         f'<span class="title">{html.escape(item.title)}</span>'
         f'<span class="meta">{html.escape(meta)}</span>'
         f"{removal_note}"
         "</div>"
-        f'<form method="post" action="/account/items/{html.escape(item.id)}/delete">'
+        f'<form method="post" action="{html.escape(action, quote=True)}">'
         '<button class="quiet" type="submit">Delete</button></form></li>'
     )
 
@@ -820,8 +834,16 @@ def _library_section(view: LibraryView, *, retention: timedelta | None, now: dat
     controls = f"{_search_form(view)}{_sort_links(view)}{_search_summary(view)}"
     if not view.items:
         return f'{controls}<p class="lede">Nothing in your library matches that search.</p>'
-    rows = "".join(_item_row(item, retention=retention, now=now) for item in view.items)
-    return f'{controls}<ul class="items">{rows}</ul>{_pager(view)}'
+    # Each Delete carries the page it was pressed on, and the item to scroll back to once
+    # this one is gone: the next row, or the previous one for the last row. The route
+    # rebuilds the URL from these, so several deletes in a row stay on one page.
+    place = _library_params(shelf=view.shelf, site=view.site, query=view.query, sort=view.sort, page=view.page)
+    rows = []
+    for index, item in enumerate(view.items):
+        neighbours = view.items[index + 1 : index + 2] or view.items[max(0, index - 1) : index]
+        query = place + ([("anchor", neighbours[0].id)] if neighbours else [])
+        rows.append(_item_row(item, retention=retention, now=now, delete_query=urlencode(query)))
+    return f'{controls}<ul class="items">{"".join(rows)}</ul>{_pager(view)}'
 
 
 def _shelf_links(view: LibraryView) -> str:
@@ -1409,6 +1431,14 @@ def _landing_page(settings: Settings) -> HTMLResponse:
         '<p class="small"><strong>EPUB attached means book. A lone subject URL means Saved article. '
         "Anything else means newsletter.</strong></p>"
         "</section>"
+        "<section><h2>Star and delete from your reader</h2>"
+        '<p class="small">Choose a book or article in the catalogue and your reader shows a short menu: '
+        "download it, star it, or delete it from Steepd. Starred items get their own shelf, so the ones "
+        "you mean to read are easy to find again.</p>"
+        '<p class="small">A deleted item goes to Trash on the website and stays there for '
+        f"{_human_days(TRASH_RETENTION.days)}, so you can restore it if you deleted the wrong one.</p>"
+        '<p class="small">Turn it on from your account page. It is tested with the CrossPoint firmware.</p>'
+        "</section>"
         "<section><h2>Newsletters and webpages that read like articles</h2>"
         '<p class="small">Steepd pulls the readable part from public webpages and flattens the nested '
         "tables in email newsletters. It keeps tables holding real data, drops tracking pixels, and "
@@ -1490,8 +1520,10 @@ def _privacy_page(settings: Settings) -> HTMLResponse:
         "One cookie is set, and it exists only to keep you signed in.</p></section>"
         "<section><h2>How long we keep it</h2>"
         f"<p>On the free plan an item is deleted automatically {_human_days(settings.free_retention.days)} after it "
-        "arrives, and the stored file goes with the record of it. Deleting an item yourself deletes "
-        "it straight away. Deleting your account deletes your library and your stored files, and "
+        "arrives, and the stored file goes with the record of it. Deleting an item yourself moves it "
+        f"to Trash, where it is kept for {_human_days(TRASH_RETENTION.days)} and then deleted with its "
+        "file; Delete permanently in Trash removes it straight away. Deleting your account deletes "
+        "your library and your stored files, and "
         "your inbox address is held back so nobody else can ever be sent your mail.</p></section>"
         f"{_privacy_organization_section(settings)}"
         "<section><h2>Who else is involved</h2>"
@@ -2958,13 +2990,34 @@ def build_web_router(
         return _redirect("/account")
 
     @router.post("/account/items/{item_id}/delete", dependencies=[SameOrigin])
-    async def delete_item(item_id: str, session: SignedIn) -> Response:
+    async def delete_item(
+        item_id: str,
+        session: SignedIn,
+        shelf: str = "",
+        site: str = "",
+        q: str = "",
+        sort: str = "",
+        page: str = "",
+        anchor: str = "",
+    ) -> Response:
         # To the trash, not gone: this is one click with no confirmation. The return value
         # is deliberately ignored: an unknown or already-deleted id is the same outcome
         # from where the user is standing, and reporting it would make this route say
         # whether an id exists.
         await run_in_threadpool(storage.trash, TenantScope(session.tenant.id), item_id)
-        return _redirect("/account/library?notice=trashed")
+        # Back to the same shelf, search, sort and page, rebuilt from cleaned values so the
+        # query string cannot send the browser anywhere else. A page past the new end is
+        # clamped by the library route.
+        chosen_shelf = _clean_shelf(shelf)
+        place = _library_params(
+            shelf=chosen_shelf,
+            site=_clean_site(site, shelf=chosen_shelf),
+            query=_clean_query(q),
+            sort=_clean_sort(sort),
+            page=_clean_page(page),
+        )
+        fragment = f"#item-{anchor}" if re.fullmatch(r"[0-9a-f]{1,64}", anchor) else ""
+        return _redirect(f"/account/library?{urlencode([*place, ('notice', 'trashed')])}{fragment}")
 
     @router.get("/account/trash")
     def trash(session: SignedIn, notice: str = "") -> Response:

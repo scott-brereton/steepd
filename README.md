@@ -33,6 +33,18 @@ source for it, under the AGPL, so you can also run your own.
   and Books. Saved webpages are grouped by the site they came from. Newsletters can be
   grouped by publication; that is an opt-in which sends newsletter text to a model
   provider, described under "Automatic newsletter organization" below.
+- Deleting an item moves it to Trash, where it can be restored for seven days. After that
+  the hourly sweep deletes it and its file; **Delete permanently** in Trash does so
+  straight away. Trashed items still count toward storage. Sending the same file again
+  restores it rather than storing a second copy.
+- **Star and delete from your reader** is an opt-in on the account page. With it on,
+  choosing an item in the catalogue opens a menu with the real download, Star or Unstar,
+  and Delete from Steepd, and the catalogue has a Starred shelf. Readers can only follow
+  links, so these are GET requests. Each one sets a value rather than toggling it and
+  carries the item revision its menu showed, so a request a reader replays with Back after
+  a later change does nothing. Delete only moves the item to Trash. It is tested on
+  CrossPoint; a client that loads links in advance could star or delete items, which is
+  why it is off by default.
 - Anyone who has your address can send to it by default. The account page can restrict
   that to listed senders.
 - The account page's **Email Verification** checkbox can relay exactly the next inbound
@@ -121,6 +133,7 @@ Optional, each feature off until set:
 |---|---|
 | `MAIL_FROM_ADDRESS` | The From for all outbound mail, e.g. `Steepd <hello@example.com>`. Without it there is no sign-in by email, rejection replies or temporary email-verification relay. |
 | `APP_ENVIRONMENT` | `production` turns on the hourly retention sweep and requires HTTPS. Anything else is development. |
+| `READER_ACTIONS_ENABLED` | Defaults to `true`. Set `false` to switch off Star and Delete in the catalogue for every account at once; their links then answer 404, including ones already open on a reader. Each account still has to opt in while it is `true`. |
 | `PORT` | Listening port. Defaults to 8000. |
 | `STATS_TOKEN` | Bearer token for `GET /admin/stats`, which prints accounts, items, thirty days of inbound results and disk usage. Unset, the route answers 404 to everyone. `ops/stats.sh` wraps the request. |
 | `SOURCE_REPOSITORY_URL` | HTTPS link rendered in the site footer as the AGPL source offer. |
@@ -204,7 +217,6 @@ cleanup thread. Changing an account's plan still takes effect without a restart.
   organizer has nothing to enqueue — a newsletter with no row in
   `newsletter_organization` *is* the work still to do, which is why importing mail is
   untouched by the feature and why turning it on needs no catch-up pass.
-- No web upload. Email is the only way in, on purpose.
 - No RSS, browser extension, paywall bypass, or site-specific extraction rules.
 
 ## Contributing
