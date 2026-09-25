@@ -134,7 +134,7 @@ def _add_page_links(
         _link(root, rel="next", href=_absolute(base_url, path, query), media_type=media_type)
 
 
-def build_root_catalog(database: Database, scope: TenantScope, base_url: str) -> bytes:
+def build_root_catalog(database: Database, scope: TenantScope, base_url: str, *, probe: bool = False) -> bytes:
     show_publications, catalogue_updated_at = database.newsletter_catalogue_state(scope)
     # The newest arrival alone cannot express a rename, a merge, an expiry, or this feed's
     # own Newsletters link changing target, so the catalogue clock is folded in. Both are
@@ -184,6 +184,108 @@ def build_root_catalog(database: Database, scope: TenantScope, base_url: str) ->
         updated=updated,
         href=_absolute(base_url, "/opds/books"),
         description="Every book in your library",
+    )
+    if probe:
+        _navigation_entry(
+            root,
+            entry_id="urn:steepd:probe",
+            title="Action probe",
+            updated=updated,
+            href=_absolute(base_url, "/opds/probe"),
+            description="Test item menus. Nothing here changes your library",
+            media_type=NAVIGATION_TYPE,
+        )
+    return _serialize(root)
+
+
+# -- action probe ------------------------------------------------------
+# A throwaway catalogue for finding out, on a real reader, how an item menu behaves: one
+# real download row and two action rows that are ordinary navigation entries. The action
+# routes only log the request and answer with a result feed, so nothing here can change a
+# library. Status goes in entry titles because CrossPoint keeps no entry content, and every
+# feed carries at least one row because it treats an empty feed as an error.
+
+PROBE_LIST_SIZE = 5
+PROBE_VERBS = {"star": "Star", "trash": "Delete from Steepd"}
+
+
+def build_probe_catalog(database: Database, scope: TenantScope, base_url: str) -> bytes:
+    items = database.list_items(scope, limit=PROBE_LIST_SIZE, offset=0)
+    updated = items[0].created_at if items else database.latest_created_at(scope)
+    root = _feed("urn:steepd:probe", "Action probe", updated)
+    _add_common_links(root, base_url=base_url, self_path="/opds/probe", self_type=NAVIGATION_TYPE, search=False)
+    for item in items:
+        _navigation_entry(
+            root,
+            entry_id=f"urn:steepd:probe:item:{item.id}",
+            title=item.title,
+            updated=item.created_at,
+            href=_absolute(base_url, f"/opds/probe/items/{item.id}"),
+            description="Open this item's menu",
+            media_type=NAVIGATION_TYPE,
+        )
+    if not items:
+        _navigation_entry(
+            root,
+            entry_id="urn:steepd:probe:empty",
+            title="Nothing to test yet. Back to library",
+            updated=updated,
+            href=_absolute(base_url, "/opds"),
+            description="",
+            media_type=NAVIGATION_TYPE,
+        )
+    return _serialize(root)
+
+
+def build_probe_menu(item: Item, base_url: str) -> bytes:
+    root = _feed(f"urn:steepd:probe:menu:{item.id}", item.title, item.created_at)
+    _add_common_links(
+        root, base_url=base_url, self_path=f"/opds/probe/items/{item.id}", self_type=NAVIGATION_TYPE, search=False
+    )
+    # The download row keeps the item's own title and author: CrossPoint names the local
+    # file after them, so a row titled "Download" would save Download.epub.
+    _acquisition_entry(root, item, base_url)
+    for verb, label in PROBE_VERBS.items():
+        _navigation_entry(
+            root,
+            entry_id=f"urn:steepd:probe:{verb}:{item.id}",
+            title=label,
+            updated=item.created_at,
+            href=_absolute(base_url, f"/opds/probe/actions/{item.id}/{verb}"),
+            description="",
+            media_type=NAVIGATION_TYPE,
+        )
+    return _serialize(root)
+
+
+def build_probe_result(item: Item, verb: str, hit: int, base_url: str) -> bytes:
+    root = _feed(f"urn:steepd:probe:result:{item.id}:{verb}", PROBE_VERBS[verb], item.created_at)
+    _add_common_links(
+        root,
+        base_url=base_url,
+        self_path=f"/opds/probe/actions/{item.id}/{verb}",
+        self_type=NAVIGATION_TYPE,
+        search=False,
+    )
+    # The hit count is in the title so a repeat request -- Back, a reconnect -- shows up
+    # on the device as well as in the log.
+    _navigation_entry(
+        root,
+        entry_id=f"urn:steepd:probe:return:{item.id}",
+        title=f"{PROBE_VERBS[verb]} request #{hit} logged. Nothing changed. Return to item",
+        updated=item.created_at,
+        href=_absolute(base_url, f"/opds/probe/items/{item.id}"),
+        description="",
+        media_type=NAVIGATION_TYPE,
+    )
+    _navigation_entry(
+        root,
+        entry_id="urn:steepd:probe:library",
+        title="Back to library",
+        updated=item.created_at,
+        href=_absolute(base_url, "/opds"),
+        description="",
+        media_type=NAVIGATION_TYPE,
     )
     return _serialize(root)
 

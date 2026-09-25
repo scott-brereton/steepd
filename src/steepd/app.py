@@ -5,6 +5,7 @@
 # every scoped route silently degrades into one expecting a query parameter (422).
 import hmac
 import logging
+from collections import Counter
 from collections.abc import Callable
 from typing import Annotated
 
@@ -28,13 +29,18 @@ from steepd.inbound import (
     ResendInboundProvider,
 )
 from steepd.middleware import BodySizeLimitMiddleware, SecurityHeadersMiddleware
+from steepd.models import Item
 from steepd.newsletter import NewsletterForwardingError
 from steepd.opds import (
     ACQUISITION_TYPE,
     NAVIGATION_TYPE,
+    PROBE_VERBS,
     author_from_token,
     build_authors_catalog,
     build_items_catalog,
+    build_probe_catalog,
+    build_probe_menu,
+    build_probe_result,
     build_publication_catalog,
     build_publications_catalog,
     build_root_catalog,
@@ -183,6 +189,34 @@ def create_app(
     DeviceScope = Annotated[TenantScope, Depends(device_scope)]
     Page = Annotated[int, Query(ge=1)]
 
+    def probe_allowed(credentials: Annotated[HTTPBasicCredentials | None, Depends(basic)]) -> bool:
+        # Only meaningful next to DeviceScope, which has already checked the password.
+        return credentials is not None and credentials.username in settings.opds_probe_usernames
+
+    def probe_scope(scope: DeviceScope, allowed: Annotated[bool, Depends(probe_allowed)]) -> TenantScope:
+        if not allowed:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+        return scope
+
+    ProbeScope = Annotated[TenantScope, Depends(probe_scope)]
+    # Counts per process, which is all the probe needs: a repeat shows up as #2.
+    probe_hits: Counter[tuple[str, str, str]] = Counter()
+
+    def _probe_item(scope: TenantScope, item_id: str, request: Request, what: str) -> Item:
+        item = database.get_item(scope, item_id)
+        LOGGER.info(
+            "OPDS probe %s: tenant=%s item=%s found=%s ua=%r range=%r",
+            what,
+            scope.tenant_id,
+            item_id,
+            item is not None,
+            request.headers.get("user-agent", ""),
+            request.headers.get("range", ""),
+        )
+        if item is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Item not found")
+        return item
+
     def _items_feed(scope: TenantScope, *, title: str, feed_id: str, page: int, **filters: str | None) -> Response:
         return _xml_response(
             build_items_catalog(
@@ -231,8 +265,10 @@ def create_app(
 
     @app.get("/opds")
     @app.get("/opds/", include_in_schema=False)
-    def opds_root(scope: DeviceScope) -> Response:
-        return _xml_response(build_root_catalog(database, scope, settings.public_base_url), NAVIGATION_TYPE)
+    def opds_root(scope: DeviceScope, probe: Annotated[bool, Depends(probe_allowed)]) -> Response:
+        return _xml_response(
+            build_root_catalog(database, scope, settings.public_base_url, probe=probe), NAVIGATION_TYPE
+        )
 
     @app.get("/opds/recent")
     def opds_recent(scope: DeviceScope, page: Page = 1) -> Response:
@@ -324,6 +360,26 @@ def create_app(
         response = FileResponse(path, media_type=EPUB_MIME_TYPE, filename=item.download_filename)
         response.headers["Cache-Control"] = "private, no-store"
         return response
+
+    @app.get("/opds/probe")
+    def opds_probe(scope: ProbeScope, request: Request) -> Response:
+        LOGGER.info("OPDS probe list: tenant=%s ua=%r", scope.tenant_id, request.headers.get("user-agent", ""))
+        return _xml_response(build_probe_catalog(database, scope, settings.public_base_url), NAVIGATION_TYPE)
+
+    @app.get("/opds/probe/items/{item_id}")
+    def opds_probe_menu(item_id: str, scope: ProbeScope, request: Request) -> Response:
+        item = _probe_item(scope, item_id, request, "menu")
+        return _xml_response(build_probe_menu(item, settings.public_base_url), NAVIGATION_TYPE)
+
+    @app.get("/opds/probe/actions/{item_id}/{verb}")
+    def opds_probe_action(item_id: str, verb: str, scope: ProbeScope, request: Request) -> Response:
+        if verb not in PROBE_VERBS:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+        item = _probe_item(scope, item_id, request, f"action {verb}")
+        probe_hits[(scope.tenant_id, item.id, verb)] += 1
+        hit = probe_hits[(scope.tenant_id, item.id, verb)]
+        LOGGER.info("OPDS probe action %s hit #%d: tenant=%s item=%s", verb, hit, scope.tenant_id, item.id)
+        return _xml_response(build_probe_result(item, verb, hit, settings.public_base_url), NAVIGATION_TYPE)
 
     # -- inbound email ---------------------------------------------------
 
