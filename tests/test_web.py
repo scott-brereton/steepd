@@ -38,6 +38,12 @@ from steepd.web import (
 BASE_URL = "http://localhost:8000"
 INBOX_DOMAIN = "read.example.test"
 EMAIL = "reader@example.test"
+# Sign-up turns away anything that does not name a current browser, and the test client's
+# own user agent is "testclient".
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/155.0.0.0 Safari/537.36"
+)
 
 
 def _build_client(tmp_path, monkeypatch, *, base_url=BASE_URL, capture=True, **overrides):
@@ -48,7 +54,7 @@ def _build_client(tmp_path, monkeypatch, *, base_url=BASE_URL, capture=True, **o
     sent: list[dict] = []
     if capture:
         monkeypatch.setattr("steepd.web.send_email", lambda settings, **message: sent.append(message))
-    return TestClient(app, base_url=base_url), sent
+    return TestClient(app, base_url=base_url, headers={"User-Agent": BROWSER_UA}), sent
 
 
 @pytest.fixture
@@ -201,6 +207,92 @@ def test_a_malformed_address_is_answered_by_the_form_again(web):
     assert "you@example.com" in response.text
     assert sent == []
     assert client.app.state.database.tenant_by_email("not-an-address") is None
+
+
+# -- automated sign-ups --------------------------------------------------------
+
+# From the bot that posted the sign-up form about a dozen times a day in October 2026,
+# mailing a sign-in link to a different stranger each time. Every one names a browser
+# released before 2016, or no browser at all.
+BOT_USER_AGENTS = [
+    "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.2; Win64; x64; Trident/6.0; .NET4.0E; .NET4.0C)",
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; Trident/7.0; MAAU; rv:11.0) like Gecko",
+    "Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/43.0.2357.130 Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 5.0.2; LG-V410/V41020c Build/LRX22G) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Version/4.0 Chrome/34.0.1847.118 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:38.0) Gecko/20100101 Firefox/38.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_5) AppleWebKit/600.6.3 (KHTML, like Gecko) Version/7.1.6 "
+    "Safari/537.85.15",
+    "Mozilla/5.0 (iPad; CPU OS 8_4_1 like Mac OS X) AppleWebKit/600.1.4 (KHTML, like Gecko) Mobile/12H321",
+    "Mozilla/5.0 (iPad; CPU OS 8_3 like Mac OS X) AppleWebKit/600.1.4 (KHTML, like Gecko) CriOS/45.0.2454.68 "
+    "Mobile/12F69 Safari/600.1.4",
+    "WebslockBot/1.0",
+    "",
+]
+
+CURRENT_USER_AGENTS = [
+    BROWSER_UA,
+    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Mobile "
+    "Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/26.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 "
+    "Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0",
+    # The browser built into an Android app still says Version/4.0; its Chrome number is
+    # the one that dates it.
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Build/AP2A; wv) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Version/4.0 Chrome/150.0.0.0 Mobile Safari/537.36",
+]
+
+
+def test_both_sign_up_forms_carry_a_field_people_cannot_see(web):
+    """The landing page and /signup both post to /signup, and the bot used the landing page."""
+    client, _ = web
+    for path in ("/", "/signup"):
+        page = BeautifulSoup(client.get(path).text, "html.parser")
+        form = page.find("form", action="/signup")
+        trap = form.find("input", attrs={"name": "website"})
+        assert trap is not None, f"{path} has no hidden field"
+        assert trap["tabindex"] == "-1"
+        assert trap["autocomplete"] == "off"
+        wrapper = trap.find_parent("div", class_="trap")
+        assert wrapper["aria-hidden"] == "true"
+        assert ".trap{position:absolute;left:-10000px" in page.style.text
+
+
+def test_a_sign_up_that_fills_the_hidden_field_creates_nothing_and_sends_nothing(web):
+    """Only software fills in a field nobody can see. It gets the same page a person would,
+    so the response tells it nothing, but there is no account and no email."""
+    client, sent = web
+    response = client.post("/signup", data={"email": EMAIL, "website": "https://spam.example"})
+
+    assert response.status_code == 200
+    assert response.content == client.post("/signin", data={"email": EMAIL}).content
+    assert sent == []
+    assert client.app.state.database.tenant_by_email(EMAIL) is None
+
+
+@pytest.mark.parametrize("user_agent", BOT_USER_AGENTS)
+def test_a_sign_up_from_a_browser_this_old_is_turned_away_and_told_why(web, user_agent):
+    """A person on an old e-reader's browser could be caught too, so the refusal says what
+    to do instead of claiming a link is on its way."""
+    client, sent = web
+    response = client.post("/signup", data={"email": EMAIL}, headers={"User-Agent": user_agent})
+
+    assert response.status_code == 400
+    assert "This browser is too old to sign up with." in response.text
+    assert sent == []
+    assert client.app.state.database.tenant_by_email(EMAIL) is None
+
+
+@pytest.mark.parametrize("user_agent", CURRENT_USER_AGENTS)
+def test_a_sign_up_from_a_current_browser_is_sent_a_link(web, user_agent):
+    client, sent = web
+    response = client.post("/signup", data={"email": EMAIL}, headers={"User-Agent": user_agent})
+
+    assert response.status_code == 200
+    assert len(sent) == 1
 
 
 # -- magic links -------------------------------------------------------------
@@ -1646,7 +1738,7 @@ def test_two_accounts_racing_for_one_name_get_a_page_not_a_crash(web):
     open. The loser of that race must be told the name went, the same as anyone who asks
     for a name that was already gone."""
     client, sent = web
-    second = TestClient(client.app, base_url=BASE_URL)
+    second = TestClient(client.app, base_url=BASE_URL, headers={"User-Agent": BROWSER_UA})
     client.post("/signup", data={"email": EMAIL})
     _redeem(client, _magic_link(sent[-1]))
     second.post("/signup", data={"email": "other@example.test"})

@@ -39,6 +39,10 @@ BASE_URL = "http://localhost:8000"
 INBOX_DOMAIN = "read.example.test"
 ONE_IP = ("198.51.100.7", 4001)
 OTHER_IP = ("203.0.113.9", 4002)
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/155.0.0.0 Safari/537.36"
+)
 
 SIGNUP_LIMIT = POLICIES[SIGNUP_BUCKET].limit
 SIGNIN_LIMIT = POLICIES[SIGNIN_BUCKET].limit
@@ -82,7 +86,8 @@ def clock(app):
 
 
 def _client(app, address=ONE_IP) -> TestClient:
-    return TestClient(app, base_url=BASE_URL, client=address)
+    # A current browser's user agent: sign-up turns away the test client's own.
+    return TestClient(app, base_url=BASE_URL, client=address, headers={"User-Agent": BROWSER_UA})
 
 
 def _auth_header(username: str, password: str) -> dict[str, str]:
@@ -303,7 +308,7 @@ def test_pages_and_the_signed_webhook_are_never_limited(app):
 
 def test_a_request_without_a_client_address_shares_one_bucket(app):
     """ASGI leaves scope["client"] optional. Missing must not mean unlimited."""
-    client = TestClient(app, base_url=BASE_URL, client=None)
+    client = TestClient(app, base_url=BASE_URL, client=None, headers={"User-Agent": BROWSER_UA})
     for index in range(SIGNUP_LIMIT):
         assert client.post("/signup", data={"email": f"anon{index}@example.test"}).status_code == 200
     assert client.post("/signup", data={"email": "anon-over@example.test"}).status_code == 429

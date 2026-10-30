@@ -94,6 +94,22 @@ MAGIC_EMAIL_SUBJECT = "Sign in to Steepd"
 # cannot be used to push a large value through the mail provider.
 MAX_EMAIL_LENGTH = 320
 
+# Sign-up is the one form that mails a stranger, so it is the one scripts post to.
+TRAP_FIELD = "website"
+OUTDATED_BROWSER_ERROR = (
+    "This browser is too old to sign up with. Try again in an up-to-date browser on your phone or computer."
+)
+# The oldest major version of each engine a sign-up is accepted from, all released in 2018.
+# A browser that reports one engine's number inside another's name -- Edge, Samsung
+# Internet, an Android app's built-in browser -- is dated by its Chrome number.
+_IOS_VERSION = re.compile(r"\b(?:iPhone|iPad|iPod)\b.*? OS (\d+)_")
+_ENGINE_VERSIONS = (
+    (re.compile(r"\b(?:Chrome|CriOS)/(\d+)"), 70),
+    (re.compile(r"\b(?:Firefox|FxiOS)/(\d+)"), 60),
+    (re.compile(r"\bVersion/(\d+)[.\d]* (?:Mobile/\S+ )?Safari/"), 12),
+)
+_OLDEST_IOS = 12
+
 # A page of cards rather than a feed of entries, so smaller than opds.PAGE_SIZE.
 ACCOUNT_PAGE_SIZE = 25
 ACCOUNT_SORTS = ("newest", "oldest", "title")
@@ -330,6 +346,7 @@ button{font:600 16px/1 ui-rounded,-apple-system,system-ui,sans-serif;padding:14p
 border-radius:8px;background:var(--umber);color:#fff;cursor:pointer}
 button:hover{background:#5A3720}
 .fineprint{font-size:14px;color:var(--muted);margin:10px 0 0}
+.trap{position:absolute;left:-10000px;width:1px;height:1px;overflow:hidden}
 .notice{background:var(--card);border:1px solid var(--umber);border-radius:8px;padding:12px 16px;
 font-size:15px;margin:0 0 18px}
 section{padding:32px 0 0;border-top:1px solid var(--rule);margin-top:32px}
@@ -491,12 +508,20 @@ def _notice(message: str) -> str:
     return f'<p class="notice">{html.escape(message)}</p>' if message else ""
 
 
-def _email_form(action: str, submit_label: str, email: str) -> str:
+def _email_form(action: str, submit_label: str, email: str, *, trap: bool = False) -> str:
+    # The trap is a field placed off-screen, out of the tab order and hidden from screen
+    # readers. A person never fills it in; software that fills in every field does.
+    trap_field = (
+        f'<div class="trap" aria-hidden="true"><label>Leave this field empty '
+        f'<input type="text" name="{TRAP_FIELD}" tabindex="-1" autocomplete="off"></label></div>'
+        if trap
+        else ""
+    )
     return (
         f'<form method="post" action="{action}"><div class="field">'
         '<input type="email" name="email" placeholder="you@example.com" required '
         f'autocomplete="email" aria-label="Email address" value="{html.escape(email)}">'
-        f"<button type=\"submit\">{submit_label}</button></div></form>"
+        f"<button type=\"submit\">{submit_label}</button></div>{trap_field}</form>"
     )
 
 
@@ -507,7 +532,7 @@ def _signup_page(*, email: str = "", error: str = "", status_code: int = status.
         "<h1>Read it on your e-reader</h1>"
         '<p class="lede">You get a private email address to send newsletters and books to, and a '
         "catalogue feed your reader subscribes to once.</p>"
-        f"{_email_form('/signup', 'Create an account', email)}"
+        f"{_email_form('/signup', 'Create an account', email, trap=True)}"
         '<p class="fineprint">We send a sign-in link to that address. There is no password to choose.</p>'
         '<p class="fineprint">Already have an account? <a href="/signin">Sign in</a>.</p>',
         status_code=status_code,
@@ -1388,7 +1413,7 @@ def _footer(source_url: str) -> str:
 
 def _landing_page(settings: Settings) -> HTMLResponse:
     source_url = settings.source_repository_url
-    signup = _email_form("/signup", LANDING_SUBMIT_LABEL, "")
+    signup = _email_form("/signup", LANDING_SUBMIT_LABEL, "", trap=True)
     return _page(
         "Steepd — reading for small e-ink readers",
         '<div class="hero">'
@@ -1954,6 +1979,26 @@ def _looks_like_email(value: str) -> bool:
         return False
     local, separator, domain = value.partition("@")
     return bool(local and separator and domain and "@" not in domain)
+
+
+def _is_outdated_browser(user_agent: str) -> bool:
+    """Whether a user agent names no browser, or one from before 2018.
+
+    The sign-up bot of October 2026 named a different browser every time, and every one of
+    them was from before 2016. A user agent is trivial to fake, so this only catches
+    software that does not bother; that was all of it.
+    """
+    if not user_agent.startswith("Mozilla/5.0 ") or "MSIE " in user_agent or "Trident/" in user_agent:
+        return True
+    ios = _IOS_VERSION.search(user_agent)
+    if ios:
+        # Every browser on iOS runs Safari's engine, which is as old as the system.
+        return int(ios.group(1)) < _OLDEST_IOS
+    for pattern, oldest in _ENGINE_VERSIONS:
+        match = pattern.search(user_agent)
+        if match:
+            return int(match.group(1)) < oldest
+    return False
 
 
 def _is_on_inbox_domain(email: str, inbox_domain: str) -> bool:
@@ -2649,7 +2694,8 @@ def build_web_router(
 
     @router.post("/signup", dependencies=[SameOrigin])
     async def signup(request: Request) -> Response:
-        email = _submitted_email(await _form_fields(request))
+        fields = await _form_fields(request)
+        email = _submitted_email(fields)
         if not _looks_like_email(email):
             return _signup_page(
                 email=email,
@@ -2661,6 +2707,18 @@ def build_web_router(
                 email=email,
                 error="Sign up with your own email address. Steepd inbox addresses are for sending things in.",
                 status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        if fields.get(TRAP_FIELD):
+            # The page a real sign-up gets, so the response tells the sender nothing. No
+            # account, and no email to the address it supplied.
+            LOGGER.info("Dropped a sign-up that filled in the hidden field")
+            return _check_email_page(email)
+        if _is_outdated_browser(request.headers.get("user-agent", "")):
+            # Said out loud rather than dropped quietly: the browser on an e-reader can be
+            # this old, and its owner should not wait for a link that is never sent.
+            LOGGER.info("Turned away a sign-up from an outdated browser")
+            return _signup_page(
+                email=email, error=OUTDATED_BROWSER_ERROR, status_code=status.HTTP_400_BAD_REQUEST
             )
         return await run_in_threadpool(_begin_sign_in, email, create=True)
 
